@@ -29,7 +29,7 @@
   const LARAVEL_API_URL = resolveLaravelApiBase();
   const SOCKET_INTERNAL_SECRET = process.env.SOCKET_INTERNAL_SECRET || "";
   const RIDE_VISIBILITY_MS = Math.max(
-    10000,
+    60000,
     Number(process.env.RIDE_VISIBILITY_SECONDS || 60) * 1000
   );
 
@@ -48,12 +48,326 @@
       return [data.ride.ride_details];
     }
 
-    if (data.fare_updated && data.ride && typeof data.ride === "object") {
+    if (data.ride && typeof data.ride === "object" && (data.ride.id || data.ride.ride_id)) {
       return [data.ride];
     }
 
     return [];
   }
+
+  function buildFreshRideShowPayload(rides, options = {}) {
+    const list = Array.isArray(rides) ? rides : [];
+    const rideId = list[0]?.id ?? list[0]?.ride_id ?? options.ride_id ?? null;
+    const isHide = options.hidden === true || (list.length === 0 && options.hideEmpty);
+
+    return {
+      success: true,
+      data: sanitizeRidesForApp(list),
+      count: list.length,
+      hidden: isHide,
+      timestamp: new Date().toISOString(),
+      ...(isHide ? { reason: options.reason || "visibility_timeout" } : {}),
+      ...(list.length > 0 && !isHide && rideId
+        ? { show_token: `${rideId}-${Date.now()}` }
+        : {}),
+      visibility_seconds: RIDE_VISIBILITY_MS / 1000,
+    };
+  }
+
+  async function emitRideVisibilityReset(userId, rideId, reason = "fare_updated") {
+    if (!rideId) return;
+
+    const payload = {
+      ride_id: rideId,
+      visibility_seconds: RIDE_VISIBILITY_MS / 1000,
+      reason,
+      fare_updated: reason === "fare_updated",
+      reshow: true,
+      timestamp: new Date().toISOString(),
+    };
+
+    io.to(`user:${userId}`).emit("driver:ride-visibility-reset", payload);
+
+    const sockets = await io.fetchSockets();
+    for (const sock of sockets) {
+      const meta = socketMeta.get(sock.id);
+      if (!meta || Number(meta.userId) !== Number(userId)) continue;
+      sock.emit("driver:ride-visibility-reset", payload);
+    }
+
+    console.log(
+      "[socket] 🔁 driver:ride-visibility-reset user_id=%s ride_id=%s reason=%s",
+      userId,
+      rideId,
+      reason
+    );
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function buildCallbackRidePayload(rides, options = {}) {
+    const list = Array.isArray(rides) ? rides : [];
+    const rideId = list[0]?.id ?? list[0]?.ride_id ?? options.ride_id ?? null;
+    const asNewRide = !!options.as_new_ride;
+    const fareUpdated = !!options.fare_updated && !asNewRide;
+
+    const payload = {
+      success: true,
+      data: sanitizeRidesForApp(list),
+      count: list.length,
+      timestamp: new Date().toISOString(),
+      ...(rideId ? { show_token: `${rideId}-${Date.now()}` } : {}),
+    };
+
+    if (asNewRide) {
+      payload.ride_id = rideId;
+      return payload;
+    }
+
+    if (fareUpdated) {
+      payload.fare_updated = true;
+      payload.reshow = true;
+      payload.visibility_reset = true;
+      payload.ride_id = rideId;
+      payload.reason = "fare_updated";
+    }
+
+    return payload;
+  }
+
+  function buildNewRideSocketPayload(ride) {
+    const rideId = ride?.id ?? ride?.ride_id ?? null;
+    const clean = sanitizeRidesForApp([ride])[0] || ride;
+
+    return {
+      ride: clean,
+      ride_id: rideId,
+      id: rideId,
+      ride_details: clean,
+      start: clean.start ?? ride.start,
+      destination: clean.destination ?? ride.destination,
+      estimated_fare: clean.final_fare ?? clean.estimated_fare ?? ride.final_fare ?? ride.estimated_fare,
+      final_fare: clean.final_fare ?? clean.estimated_fare ?? ride.final_fare ?? ride.estimated_fare,
+      vehicle_category_id: clean.vehicle_category_id ?? ride.vehicle_category_id,
+      status: clean.status ?? ride.status,
+      message: "New ride available nearby",
+      success: true,
+      count: 1,
+      timestamp: new Date().toISOString(),
+      show_token: rideId ? `${rideId}-${Date.now()}` : undefined,
+    };
+  }
+
+  async function emitToDriver(userId, eventName, payload) {
+    const room = `user:${userId}`;
+    io.to(room).emit(eventName, payload);
+
+    const sockets = await io.fetchSockets();
+    for (const sock of sockets) {
+      const meta = socketMeta.get(sock.id);
+      if (!meta || Number(meta.userId) !== Number(userId)) continue;
+      sock.emit(eventName, payload);
+    }
+  }
+
+  async function emitNearbyRidesListShow(userId, rides, logSource = "show") {
+    const list = Array.isArray(rides) ? rides : [];
+    if (list.length === 0) return null;
+
+    const payload = buildFreshRideShowPayload(list, { hidden: false });
+    const rideId = list[0]?.id ?? list[0]?.ride_id ?? null;
+
+    await emitToDriver(userId, "driver:nearby-rides:list", payload);
+    // Some app builds listen to callback-style result event for UI updates
+    await emitToDriver(userId, "driver:nearby-rides:result", payload);
+
+    const sockets = await io.fetchSockets();
+    let directCount = 0;
+    for (const sock of sockets) {
+      const meta = socketMeta.get(sock.id);
+      if (!meta || Number(meta.userId) !== Number(userId)) continue;
+      directCount++;
+    }
+
+    console.log(
+      "[socket] 📤 driver:nearby-rides:list user_id=%s count=%d hidden=false ride_id=%s source=%s sockets=%d",
+      userId,
+      payload.count,
+      rideId,
+      logSource,
+      directCount
+    );
+
+    return payload;
+  }
+
+  async function emitDriverRideEvents(userId, rides, options = {}) {
+    const list = Array.isArray(rides) ? rides : [];
+    const ride = list[0] || null;
+    const rideId = ride?.id ?? ride?.ride_id ?? options.ride_id ?? null;
+    const fareUpdated = !!options.fare_updated;
+    const room = `user:${userId}`;
+
+    const listPayload = buildFreshRideShowPayload(list, {
+      hidden: false,
+      fare_updated: fareUpdated,
+      ride_id: rideId,
+    });
+
+    io.to(room).emit("driver:nearby-rides:list", listPayload);
+
+    if (ride) {
+      const newRidePayload = buildNewRideSocketPayload(ride);
+      newRidePayload.message = fareUpdated
+        ? "Updated fare ride available nearby"
+        : "New ride available nearby";
+      io.to(room).emit("driver:new-ride-available", newRidePayload);
+    }
+
+    const sockets = await io.fetchSockets();
+    let directCount = 0;
+    for (const sock of sockets) {
+      const meta = socketMeta.get(sock.id);
+      if (!meta || Number(meta.userId) !== Number(userId)) continue;
+      sock.emit("driver:nearby-rides:list", listPayload);
+      if (ride) {
+        const newRidePayload = buildNewRideSocketPayload(ride);
+        newRidePayload.message = fareUpdated
+          ? "Updated fare ride available nearby"
+          : "New ride available nearby";
+        sock.emit("driver:new-ride-available", newRidePayload);
+      }
+      directCount++;
+    }
+
+    console.log(
+      "[socket] 📤 driver:nearby-rides:list user_id=%s count=%d hidden=false ride_id=%s fare=%s sockets=%d",
+      userId,
+      listPayload.count,
+      rideId,
+      fareUpdated,
+      directCount
+    );
+
+    return listPayload;
+  }
+
+  async function emitNearbyRidesListEvent(userId, rides, options = {}) {
+    if (options.hidden === true || (options.hideEmpty && (!rides || rides.length === 0))) {
+      const rideId = options.ride_id ?? null;
+      const payload = {
+        success: true,
+        count: 0,
+        hidden: true,
+        reason: options.reason || "visibility_timeout",
+        ride_id: rideId,
+        timestamp: new Date().toISOString(),
+      };
+      const room = `user:${userId}`;
+      io.to(room).emit("driver:nearby-rides:list", payload);
+
+      const sockets = await io.fetchSockets();
+      let directCount = 0;
+      for (const sock of sockets) {
+        const meta = socketMeta.get(sock.id);
+        if (!meta || Number(meta.userId) !== Number(userId)) continue;
+        sock.emit("driver:nearby-rides:list", payload);
+        directCount++;
+      }
+
+      console.log(
+        "[socket] 📤 driver:nearby-rides:list user_id=%s count=0 hidden=true ride_id=%s sockets=%d",
+        userId,
+        rideId,
+        directCount
+      );
+      return payload;
+    }
+
+    return emitDriverRideEvents(userId, rides, {
+      fare_updated: !!options.fare_updated,
+      reshow: !!options.reshow,
+      visibility_reset: !!options.visibility_reset,
+      ride_id: options.ride_id,
+    });
+  }
+
+  async function emitShowRidesToDriver(userId, rides, source = "visible", fareUpdated = false) {
+    const state = getDriverRideState(userId);
+    let list = Array.isArray(rides) ? rides : [];
+
+    state.hidden = false;
+    state.showProtectedUntil = Date.now() + 15000;
+    state.lastRides = list;
+
+    if (state.hideTimer) {
+      clearTimeout(state.hideTimer);
+      state.hideTimer = null;
+    }
+
+    if (list.length === 0) {
+      return;
+    }
+
+    rememberDriverShownRide(userId, list);
+    await emitNearbyRidesListShow(userId, list, fareUpdated ? "fare_updated" : source);
+    lockDriverRideShow(userId, list, fareUpdated ? "fare_updated" : source);
+  }
+
+  function isShowProtected(userId) {
+    const state = getDriverRideState(userId);
+    return !!(state.showProtectedUntil && Date.now() < state.showProtectedUntil);
+  }
+
+  function sanitizeRidesForApp(rides) {
+    if (!Array.isArray(rides)) {
+      return [];
+    }
+
+    return rides.map((ride) => {
+      const copy = { ...(ride || {}) };
+      delete copy.fare_updated;
+      delete copy.hidden;
+      delete copy.reshow;
+      delete copy.visibility_reset;
+      return copy;
+    });
+  }
+
+  function buildNearbyRidesListPayload(rides, options = {}) {
+    if (options.asFreshRide) {
+      return buildFreshRideShowPayload(rides);
+    }
+
+    const list = Array.isArray(rides) ? rides : [];
+    const rideId = options.ride_id ?? list[0]?.id ?? list[0]?.ride_id ?? null;
+    const isFareUpdated = !!options.fare_updated;
+
+    return {
+      success: true,
+      data: sanitizeRidesForApp(list),
+      count: list.length,
+      timestamp: new Date().toISOString(),
+      hidden: options.hidden ?? (list.length > 0 ? false : true),
+      fare_updated: isFareUpdated,
+      reshow: !!options.reshow || isFareUpdated,
+      visibility_reset: !!options.visibility_reset || isFareUpdated,
+      ride_id: rideId,
+      show_token: options.show_token ?? (rideId ? `${rideId}-${Date.now()}` : undefined),
+      visibility_seconds: options.visibility_seconds ?? RIDE_VISIBILITY_MS / 1000,
+      reason:
+        options.reason
+        ?? (isFareUpdated ? "fare_updated" : list.length > 0 ? "visible" : "empty"),
+    };
+  }
+
+  const RIDE_LIST_REFRESH_EVENTS = new Set([
+    "driver:nearby-rides:list",
+    "driver:new-ride-available",
+    "driver:rides-list-updated",
+  ]);
 
   function mergeForcedRides(rides, forcedRides) {
     if (!Array.isArray(forcedRides) || forcedRides.length === 0) {
@@ -75,7 +389,6 @@
         ...(idx >= 0 ? list[idx] : {}),
         ...forced,
         id: forced.id ?? forced.ride_id ?? forcedId,
-        fare_updated: true,
       };
 
       if (idx >= 0) {
@@ -102,17 +415,23 @@
     return [];
   }
 
-  async function deliverFareUpdatedRidesToEligibleDrivers(data, sourceEvent = "fare_updated") {
-    const eligibleIds = getEligibleDriverIdsFromBroadcast(data);
+  async function deliverRidesListToEligibleDrivers(data, sourceEvent = "driver:nearby-rides:list") {
     const forcedRides = getForcedRidesFromBroadcast(data);
+    const fareUpdated = !!(data && (data.fare_updated || data.reason === "fare_updated"));
+    const rideId = getRideIdFromBroadcast(data, forcedRides);
 
-    if (eligibleIds.length === 0 || forcedRides.length === 0) {
-      console.log("[socket] ⚠ fare update missing eligible=%d forced=%d", eligibleIds.length, forcedRides.length);
+    let eligibleIds = getEligibleDriverIdsFromBroadcast(data);
+
+    if (fareUpdated && rideId) {
+      const previouslyShown = getDriversPreviouslyShownRide(rideId);
+      eligibleIds = [...new Set([...eligibleIds, ...previouslyShown])];
+    }
+
+    if (eligibleIds.length === 0) {
+      console.log("[socket] ⚠ fare update: no eligible drivers ride_id=%s", rideId);
       return 0;
     }
 
-    const visibilityReset = getVisibilityResetPayload(data);
-    const sockets = await io.fetchSockets();
     let deliveredCount = 0;
 
     for (const driverId of eligibleIds) {
@@ -121,46 +440,18 @@
         id: ride.id ?? ride.ride_id,
         final_fare: ride.final_fare ?? ride.estimated_fare,
         estimated_fare: ride.estimated_fare ?? ride.final_fare,
-        fare_updated: true,
       }));
 
-      if (visibilityReset) {
-        io.to(`user:${driverId}`).emit("driver:ride-visibility-reset", visibilityReset);
-      }
-
-      // Always push list directly so every online driver socket receives the updated ride.
-      io.to(`user:${driverId}`).emit("driver:nearby-rides:list", {
-        success: true,
-        data: payloadRides,
-        count: payloadRides.length,
-        timestamp: new Date().toISOString(),
-        fare_updated: true,
-        hidden: false,
-        reason: "fare_updated",
+      await forceShowRidesForDriver(driverId, payloadRides, sourceEvent, {
+        fareUpdated,
+        visibilityReset: !!(data && data.visibility_reset),
+        visibilitySeconds: data?.visibility_seconds,
+        reason: data?.reason || (fareUpdated ? "fare_updated" : "visible"),
       });
-
-      for (const sock of sockets) {
-        const meta = socketMeta.get(sock.id);
-        if (!meta || Number(meta.userId) !== Number(driverId)) {
-          continue;
-        }
-
-        if (typeof sock.data.resetRideVisibilityForDriver === "function" && visibilityReset) {
-          sock.data.resetRideVisibilityForDriver(visibilityReset, sourceEvent);
-        }
-
-        if (typeof sock.data.refreshNearbyRides === "function") {
-          await sock.data.refreshNearbyRides({
-            forceRides: payloadRides,
-            fareUpdated: true,
-            source: "fare_updated_direct",
-          });
-        }
-      }
 
       deliveredCount++;
       console.log(
-        "[socket] ✓ fare update pushed to driver user_id=%s rides=%d online=%d",
+        "[socket] ✓ driver:nearby-rides:list delivered to user_id=%s rides=%d online=%d",
         driverId,
         payloadRides.length,
         getUserOnlineCount(driverId)
@@ -170,68 +461,81 @@
     return deliveredCount;
   }
 
-  async function refreshConnectedDriverSockets(data, event) {
-    const visibilityReset = getVisibilityResetPayload(data);
-    const forcedRides = getForcedRidesFromBroadcast(data);
-    const fareUpdated = !!(data && (data.fare_updated || data.reason === "fare_updated" || forcedRides.length > 0));
-    const eligibleIds = getEligibleDriverIdsFromBroadcast(data);
-    let driverRefreshCount = 0;
+  function getTargetDriverIdsFromBroadcast(data, forcedRides = []) {
+    const rideId = getRideIdFromBroadcast(data, forcedRides);
+    const targetIds = new Set(getEligibleDriverIdsFromBroadcast(data));
 
-    if (fareUpdated && eligibleIds.length > 0 && forcedRides.length > 0) {
-      driverRefreshCount = await deliverFareUpdatedRidesToEligibleDrivers(data, event);
-      console.log("[socket] ✓ Fare update delivered to %d eligible online drivers", driverRefreshCount);
+    if (rideId) {
+      getDriversPreviouslyShownRide(rideId).forEach((id) => targetIds.add(Number(id)));
+    }
+
+    if (Array.isArray(data?.previously_notified_driver_ids)) {
+      data.previously_notified_driver_ids.forEach((id) => targetIds.add(Number(id)));
+    }
+
+    return { rideId, targetIds };
+  }
+
+  async function refreshConnectedDriverSockets(data, event) {
+    const forcedRides = getForcedRidesFromBroadcast(data);
+    const fareUpdated = !!(data && (data.fare_updated || data.reason === "fare_updated"));
+    const { rideId, targetIds } = getTargetDriverIdsFromBroadcast(data, forcedRides);
+
+    if (forcedRides.length > 0) {
+      const sockets = await io.fetchSockets();
+      let driverRefreshCount = 0;
+
+      for (const sock of sockets) {
+        if (!sock.data.isDriver || !sock.data.refreshNearbyRides) {
+          continue;
+        }
+
+        const driverId = Number(sock.data.userId);
+        if (targetIds.size > 0 && !targetIds.has(driverId)) {
+          continue;
+        }
+
+        await sock.data.refreshNearbyRides({
+          forceRides: forcedRides,
+          fareUpdated,
+          source: fareUpdated ? "fare_updated" : event,
+        });
+        driverRefreshCount++;
+      }
+
+      console.log(
+        "[socket] ✓ driver:nearby-rides:list refreshed %d online drivers (ride_id=%s fare=%s)",
+        driverRefreshCount,
+        rideId,
+        fareUpdated
+      );
       return driverRefreshCount;
     }
 
+    let eligibleIds = [...targetIds];
+
+    if (eligibleIds.length > 0) {
+      const delivered = await deliverRidesListToEligibleDrivers(data, event);
+      console.log("[socket] ✓ driver:nearby-rides:list sent to %d eligible drivers", delivered);
+      return delivered;
+    }
+
     const sockets = await io.fetchSockets();
+    let driverRefreshCount = 0;
     for (const sock of sockets) {
-      const meta = socketMeta.get(sock.id);
-      const driverId = meta ? Number(meta.userId) : null;
-      const isEligible = eligibleIds.length === 0 || (driverId && eligibleIds.includes(driverId));
-
-      if (!sock.data.isDriver || !sock.data.refreshNearbyRides || !isEligible) {
+      if (!sock.data.isDriver || !sock.data.refreshNearbyRides) {
         continue;
-      }
-
-      if (visibilityReset) {
-        if (typeof sock.data.resetRideVisibilityForDriver === "function") {
-          sock.data.resetRideVisibilityForDriver(visibilityReset, event);
-        } else {
-          sock.emit("driver:ride-visibility-reset", visibilityReset);
-        }
       }
 
       await sock.data.refreshNearbyRides({
         forceRides: forcedRides,
         fareUpdated,
-        source: fareUpdated ? "fare_updated" : event,
+        source: event,
       });
       driverRefreshCount++;
     }
 
     return driverRefreshCount;
-  }
-
-  function getVisibilityResetPayload(data) {
-    if (!data) return null;
-
-    if (data.visibility_reset) {
-      return {
-        ride_id: data.ride_id,
-        visibility_seconds: data.visibility_seconds || RIDE_VISIBILITY_MS / 1000,
-        reason: data.reason || "ride_updated",
-      };
-    }
-
-    if (data.ride && data.ride.visibility_reset) {
-      return {
-        ride_id: data.ride.ride_id,
-        visibility_seconds: data.ride.visibility_seconds || RIDE_VISIBILITY_MS / 1000,
-        reason: data.ride.fare_updated ? "fare_updated" : "ride_updated",
-      };
-    }
-
-    return null;
   }
   const SOCKET_CORS_ORIGIN = process.env.SOCKET_CORS_ORIGIN || "*";
   const fetchFn = (...args) => {
@@ -269,10 +573,190 @@
       origin: SOCKET_CORS_ORIGIN === "*" ? true : SOCKET_CORS_ORIGIN.split(","),
       methods: ["GET", "POST"],
     },
+    pingTimeout: 60000,
+    pingInterval: 25000,
   });
 
   const userSockets = new Map(); // userId -> Set(socket.id)
   const socketMeta = new Map(); // socket.id -> { userId, token, roomIds[] }
+  const driverRideState = new Map(); // userId -> { hidden, lastRides, hideTimer }
+  const rideShownToDrivers = new Map(); // rideId -> Set(userId) — drivers who saw this ride on socket
+
+  function rememberDriverShownRide(userId, rides) {
+    const list = Array.isArray(rides) ? rides : [];
+    for (const ride of list) {
+      const rideId = Number(ride?.id ?? ride?.ride_id ?? 0);
+      if (!rideId) continue;
+      if (!rideShownToDrivers.has(rideId)) {
+        rideShownToDrivers.set(rideId, new Set());
+      }
+      rideShownToDrivers.get(rideId).add(Number(userId));
+    }
+  }
+
+  function getDriversPreviouslyShownRide(rideId) {
+    const set = rideShownToDrivers.get(Number(rideId));
+    return set ? [...set] : [];
+  }
+
+  function getRideIdFromBroadcast(data, forcedRides = []) {
+    if (!data) return null;
+    if (data.ride_id) return Number(data.ride_id);
+    if (data.ride?.ride_id) return Number(data.ride.ride_id);
+    if (data.ride?.id) return Number(data.ride.id);
+    const first = forcedRides[0];
+    if (first) return Number(first.id ?? first.ride_id ?? 0) || null;
+    return null;
+  }
+
+  function getDriverRideState(userId) {
+    const id = Number(userId);
+    if (!driverRideState.has(id)) {
+      driverRideState.set(id, {
+        hidden: false,
+        lastRides: [],
+        hideTimer: null,
+        showProtectedUntil: 0,
+        keepAliveInterval: null,
+      });
+    }
+    return driverRideState.get(id);
+  }
+
+  function clearDriverRideState(userId) {
+    const state = driverRideState.get(Number(userId));
+    if (state?.hideTimer) {
+      clearTimeout(state.hideTimer);
+    }
+    if (state?.keepAliveInterval) {
+      clearInterval(state.keepAliveInterval);
+    }
+    driverRideState.delete(Number(userId));
+  }
+
+  function lockDriverRideShow(userId, rides, source = "show") {
+    const state = getDriverRideState(userId);
+    const list = Array.isArray(rides) ? rides : [];
+
+    state.hidden = false;
+    state.lastRides = list;
+    state.showProtectedUntil = Date.now() + RIDE_VISIBILITY_MS;
+    rememberDriverShownRide(userId, list);
+    scheduleDriverRideHide(userId, source);
+
+    if (state.keepAliveInterval) {
+      clearInterval(state.keepAliveInterval);
+      state.keepAliveInterval = null;
+    }
+
+    if (list.length === 0) {
+      return;
+    }
+
+    // Re-send the same list during the 1-minute window so API/push refresh cannot hide it.
+    state.keepAliveInterval = setInterval(() => {
+      if (!isShowProtected(userId) || !state.lastRides?.length) {
+        clearInterval(state.keepAliveInterval);
+        state.keepAliveInterval = null;
+        return;
+      }
+      emitNearbyRidesListShow(userId, state.lastRides, "keep-alive-60s").catch(() => {});
+    }, 8000);
+  }
+
+  async function hideDriverRidesNow(userId, force = false) {
+    const state = getDriverRideState(userId);
+
+    if (!force && isShowProtected(userId)) {
+      console.log("[socket] ↷ Skip auto-hide user_id=%s (show protection)", userId);
+      return;
+    }
+
+    state.hidden = true;
+    state.lastRides = [];
+    state.showProtectedUntil = 0;
+
+    if (state.hideTimer) {
+      clearTimeout(state.hideTimer);
+      state.hideTimer = null;
+    }
+    if (state.keepAliveInterval) {
+      clearInterval(state.keepAliveInterval);
+      state.keepAliveInterval = null;
+    }
+
+    // Server-side only — do not emit hide to app (breaks fare re-show for same ride_id).
+    console.log("[socket] ⏱ Ride hidden (server-side) user_id=%s", userId);
+  }
+
+  async function fetchNearbyRidesForDriver(userId, forceRides = []) {
+    const sockets = await io.fetchSockets();
+    for (const sock of sockets) {
+      const meta = socketMeta.get(sock.id);
+      if (!meta || Number(meta.userId) !== Number(userId) || !meta.token) {
+        continue;
+      }
+
+      try {
+        const nearbyRides = await laravelFetch("/api/driver/near/by/ride", {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${meta.token}`,
+          },
+        });
+        return mergeForcedRides(nearbyRides?.data || [], forceRides);
+      } catch (error) {
+        console.error(
+          "[socket] ✗ fetchNearbyRidesForDriver user_id=%s failed: %s — using forced rides only",
+          userId,
+          error.message
+        );
+        if (forceRides.length > 0) {
+          return mergeForcedRides([], forceRides);
+        }
+      }
+    }
+
+    return mergeForcedRides([], forceRides);
+  }
+
+  function scheduleDriverRideHide(userId, source = "unknown") {
+    const state = getDriverRideState(userId);
+    if (state.hideTimer) {
+      clearTimeout(state.hideTimer);
+      state.hideTimer = null;
+    }
+
+    console.log(
+      "[socket] ⏱ Scheduling ride hide in %ds for driver user_id=%s (source=%s)",
+      RIDE_VISIBILITY_MS / 1000,
+      userId,
+      source
+    );
+
+    state.hideTimer = setTimeout(() => {
+      state.hideTimer = null;
+      hideDriverRidesNow(userId, true).catch(() => {});
+    }, RIDE_VISIBILITY_MS);
+  }
+
+  async function forceShowRidesForDriver(userId, rides, source = "fare_updated", options = {}) {
+    const forcedRides = Array.isArray(rides) ? rides : [];
+    let toShow = forcedRides;
+
+    if (!options.useForcedOnly) {
+      const mergedRides = await fetchNearbyRidesForDriver(userId, forcedRides);
+      toShow = mergedRides.length > 0 ? mergedRides : forcedRides;
+    }
+
+    if (toShow.length === 0) {
+      console.log("[socket] ⚠ no rides to show for driver user_id=%s (source=%s)", userId, source);
+      return;
+    }
+
+    const fareUpdated = options.fareUpdated === true || source.includes("fare");
+    await emitShowRidesToDriver(userId, toShow, source, fareUpdated);
+  }
 
   function authTokenFromSocket(socket) {
     const fromAuth = socket.handshake.auth && socket.handshake.auth.token;
@@ -484,68 +968,48 @@
     }
 
     const RIDE_VISIBILITY_MS_LOCAL = RIDE_VISIBILITY_MS;
-    let rideHideTimer = null;
 
-    const scheduleRideHideIfNeeded = (count, source = "unknown") => {
-      if (rideHideTimer) {
-        clearTimeout(rideHideTimer);
-        rideHideTimer = null;
+    const emitNearbyRidesWithAutoHide = (responseData, source = "unknown", isFareUpdate = false) => {
+      const count = responseData?.count ?? responseData?.data?.length ?? 0;
+
+      if (count > 0 && Array.isArray(responseData?.data)) {
+        const fareUpdated =
+          isFareUpdate
+          || source.includes("fare")
+          || source === "fare_updated_force";
+        emitShowRidesToDriver(userId, responseData.data, source, fareUpdated).catch(() => {});
+        return;
       }
 
-      if (count > 0) {
+      if (isShowProtected(userId)) {
         console.log(
-          "[socket] ⏱ Scheduling ride hide in %ds for driver user_id=%s (source=%s)",
-          RIDE_VISIBILITY_MS_LOCAL / 1000,
+          "[socket] ↷ Skip empty emit user_id=%s (show protection, source=%s)",
           userId,
           source
         );
-
-        rideHideTimer = setTimeout(() => {
-          console.log(
-            "[socket] 🙈 Auto-hiding rides after %ds for driver user_id=%s",
-            RIDE_VISIBILITY_MS_LOCAL / 1000,
-            userId
-          );
-          socket.emit("driver:nearby-rides:list", {
-            success: true,
-            data: [],
-            count: 0,
-            timestamp: new Date().toISOString(),
-            hidden: true,
-            reason: "visibility_timeout",
-          });
-          rideHideTimer = null;
-        }, RIDE_VISIBILITY_MS_LOCAL);
       }
-    };
-
-    const emitNearbyRidesWithAutoHide = (responseData, source = "unknown") => {
-      const count = responseData?.count ?? responseData?.data?.length ?? 0;
-      const payload = {
-        ...responseData,
-        hidden: count > 0 ? false : !!responseData?.hidden,
-        reason: count > 0 ? "visible" : responseData?.reason,
-      };
-
-      socket.emit("driver:nearby-rides:list", payload);
-      scheduleRideHideIfNeeded(count, source);
     };
 
     const resetRideVisibilityForDriver = (payload, source = "unknown") => {
       if (!payload) return;
 
-      if (rideHideTimer) {
-        clearTimeout(rideHideTimer);
-        rideHideTimer = null;
+      const state = getDriverRideState(userId);
+      state.hidden = false;
+      if (state.hideTimer) {
+        clearTimeout(state.hideTimer);
+        state.hideTimer = null;
       }
 
-      socket.emit("driver:ride-visibility-reset", payload);
       console.log(
-        "[socket] 🔁 Visibility reset for driver user_id=%s ride_id=%s (source=%s)",
+        "[socket] 🔁 Visibility reset (internal) for driver user_id=%s ride_id=%s (source=%s)",
         userId,
         payload.ride_id,
         source
       );
+    };
+
+    socket.data.forceShowNearbyRides = async (rides, source = "fare_updated") => {
+      await forceShowRidesForDriver(userId, rides, source);
     };
 
     socket.data.resetRideVisibilityForDriver = resetRideVisibilityForDriver;
@@ -564,7 +1028,7 @@
 
         const forcedRides = options.forceRides || [];
         const mergedRides = mergeForcedRides(nearbyRides?.data || [], forcedRides);
-        const fareUpdated = options.fareUpdated === true || forcedRides.length > 0;
+        const fareUpdated = options.fareUpdated === true;
         
         console.log(
           "[socket] 🔄 Refreshing nearby rides for driver user_id=%s, api_count=%d, merged_count=%d, source=%s",
@@ -573,40 +1037,94 @@
           mergedRides.length,
           options.source || "refresh"
         );
-        
-        emitNearbyRidesWithAutoHide({
-          success: true,
-          data: mergedRides,
-          count: mergedRides.length,
-          timestamp: new Date().toISOString(),
-          fare_updated: fareUpdated,
-          hidden: mergedRides.length > 0 ? false : undefined,
-          reason: mergedRides.length > 0 ? (fareUpdated ? "fare_updated" : "visible") : undefined,
-        }, options.source || "refresh");
+
+        const state = getDriverRideState(userId);
+        if (isShowProtected(userId) && state.lastRides?.length > 0) {
+          console.log("[socket] ↷ Skip refresh user_id=%s (1-min show lock)", userId);
+          return;
+        }
+        const hasForcedRides = forcedRides.length > 0;
+        const mayReshowWhileHidden =
+          fareUpdated
+          || hasForcedRides
+          || options.source === "fare_updated"
+          || options.source === "fare_updated_force"
+          || options.source === "fare_updated_show"
+          || options.source === "push-refresh"
+          || options.source === "app-foreground";
+
+        if (state.hidden && !mayReshowWhileHidden) {
+          return;
+        }
+
+        if (hasForcedRides && mergedRides.length > 0) {
+          emitNearbyRidesWithAutoHide(
+            {
+              success: true,
+              data: mergedRides,
+              count: mergedRides.length,
+              timestamp: new Date().toISOString(),
+            },
+            options.source || "refresh",
+            fareUpdated
+          );
+          return;
+        }
+
+        if (mergedRides.length === 0) {
+          return;
+        }
+
+        if (options.source === "interval-sync") {
+          return;
+        }
+
+        emitNearbyRidesWithAutoHide(
+          {
+            success: true,
+            data: mergedRides,
+            count: mergedRides.length,
+            timestamp: new Date().toISOString(),
+          },
+          options.source || "refresh",
+          fareUpdated
+        );
       } catch (error) {
         console.error("[socket] ✗ Refresh nearby rides error:", error.message);
 
         const forcedRides = options.forceRides || [];
         if (forcedRides.length > 0) {
-          const mergedRides = mergeForcedRides([], forcedRides);
           emitNearbyRidesWithAutoHide({
             success: true,
-            data: mergedRides,
-            count: mergedRides.length,
+            data: mergeForcedRides([], forcedRides),
+            count: forcedRides.length,
             timestamp: new Date().toISOString(),
-            fare_updated: true,
-            hidden: false,
-            reason: "fare_updated",
-          }, options.source || "refresh-forced");
+          }, options.source || "refresh-forced", true);
         }
       }
     };
     
+    let driverSyncTimer = null;
+    const startDriverSyncTimer = () => {
+      if (driverSyncTimer) {
+        clearInterval(driverSyncTimer);
+        driverSyncTimer = null;
+      }
+      if (!socket.data.isDriver) return;
+
+      driverSyncTimer = setInterval(() => {
+        if (socket.connected && socket.data.isDriver) {
+          refreshNearbyRides({ source: "interval-sync" }).catch(() => {});
+        }
+      }, 20000);
+    };
+
     (async () => {
       try {
         if (isDriver) {
           console.log("[socket] ✓ Driver connected - auto-fetching nearby rides for user_id=%s", userId);
           await refreshNearbyRides();
+          startDriverSyncTimer();
           return;
         }
 
@@ -627,6 +1145,7 @@
           socket.data.isDriver = true;
           console.log("[socket] ✓ Driver mode detected - auto-fetching nearby rides for user_id=%s", userId);
           await refreshNearbyRides();
+          startDriverSyncTimer();
         }
       } catch (error) {
         console.error("[socket] ✗ Auto-fetch nearby rides error:", error.message);
@@ -635,6 +1154,10 @@
     
     // Store refresh function for use in broadcast events
     socket.data.refreshNearbyRides = refreshNearbyRides;
+
+    if (isDriver) {
+      startDriverSyncTimer();
+    }
 
     // Global error handler for the socket
     socket.on("error", (error) => {
@@ -772,6 +1295,11 @@
       console.log("[socket] app:foreground - user_id=%s", userId);
       await setPresence(userId, true, true);
 
+      if (socket.data.isDriver && typeof socket.data.refreshNearbyRides === "function") {
+        console.log("[socket] app:foreground - refreshing nearby rides for driver user_id=%s", userId);
+        await socket.data.refreshNearbyRides({ source: "app-foreground", fareUpdated: true });
+      }
+
       const response = { ok: true, user_id: userId, is_app_foreground: true };
       if (typeof callback === "function") {
         callback(response);
@@ -791,10 +1319,86 @@
         socket.emit("app:background:result", response);
       }
     });
+    socket.on("driver:refresh-from-push", async (payload, callback) => {
+      if (isShowProtected(userId)) {
+        const locked = getDriverRideState(userId).lastRides || [];
+        if (locked.length > 0) {
+          await emitNearbyRidesListShow(userId, locked, "push-refresh-lock");
+        }
+        const response = { success: true, user_id: userId, count: locked.length };
+        if (typeof callback === "function") callback(response);
+        else socket.emit("driver:refresh-from-push:result", response);
+        return;
+      }
+
+      const state = getDriverRideState(userId);
+      state.hidden = false;
+      if (state.hideTimer) {
+        clearTimeout(state.hideTimer);
+        state.hideTimer = null;
+      }
+
+      try {
+        const raw = await laravelFetch("/api/driver/near/by/ride", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        const rides = raw?.data || [];
+        if (rides.length > 0) {
+          await emitNearbyRidesListShow(userId, rides, "push-refresh");
+          scheduleDriverRideHide(userId, "push-refresh");
+        } else {
+          await refreshNearbyRides({ source: "push-refresh", fareUpdated: true });
+        }
+        const response = { success: true, user_id: userId, count: rides.length };
+        if (typeof callback === "function") callback(response);
+        else socket.emit("driver:refresh-from-push:result", response);
+      } catch (error) {
+        const errorResponse = { success: false, message: error.message };
+        if (typeof callback === "function") callback(errorResponse);
+        else socket.emit("driver:refresh-from-push:error", errorResponse);
+      }
+    });
+
+    socket.on("driver:sync-rides", async (payload, callback) => {
+      if (!socket.data.isDriver) {
+        const error = { success: false, message: "Driver mode is not active" };
+        if (typeof callback === "function") callback(error);
+        else socket.emit("driver:sync-rides:error", error);
+        return;
+      }
+
+      try {
+        await refreshNearbyRides({ source: "manual-sync" });
+        const response = { success: true, user_id: userId };
+        if (typeof callback === "function") callback(response);
+        else socket.emit("driver:sync-rides:result", response);
+      } catch (error) {
+        const errorResponse = { success: false, message: error.message };
+        if (typeof callback === "function") callback(errorResponse);
+        else socket.emit("driver:sync-rides:error", errorResponse);
+      }
+    });
+
     socket.on("driver:nearby-rides", async (payload, callback) => {
       console.log("[socket] ✓ driver:nearby-rides listener TRIGGERED - user_id=%s", userId);
       console.log("[socket] driver:nearby-rides - payload=%O, callback present=%s", payload, typeof callback === "function");
       try {
+        if (isShowProtected(userId)) {
+          const locked = getDriverRideState(userId).lastRides || [];
+          const responseData = {
+            success: true,
+            data: locked,
+            count: locked.length,
+            hidden: false,
+            visibility_seconds: RIDE_VISIBILITY_MS / 1000,
+            timestamp: new Date().toISOString(),
+          };
+          if (typeof callback === "function") callback(responseData);
+          else emitNearbyRidesWithAutoHide(responseData, "show-lock");
+          return;
+        }
+
         console.log("[socket] driver:nearby-rides - fetching from Laravel API");
         
         const raw = await laravelFetch("/api/driver/near/by/ride", {
@@ -816,7 +1420,9 @@
         if (typeof callback === "function") {
           console.log("[socket] driver:nearby-rides - sending response via callback (ACK)");
           callback(responseData);
-          scheduleRideHideIfNeeded(responseData.count, "manual-callback");
+          if (responseData.count > 0) {
+            scheduleDriverRideHide(userId, "manual-callback");
+          }
         } else {
           console.log("[socket] driver:nearby-rides - broadcasting via emit:driver:nearby-rides:list");
           emitNearbyRidesWithAutoHide(responseData, "manual");
@@ -1411,9 +2017,9 @@
 
     socket.on("disconnect", async (reason) => {
       console.log("[socket] disconnected sid=%s reason=%s user_id=%s", socket.id, reason, userId);
-      if (rideHideTimer) {
-        clearTimeout(rideHideTimer);
-        rideHideTimer = null;
+      if (driverSyncTimer) {
+        clearInterval(driverSyncTimer);
+        driverSyncTimer = null;
       }
       const meta = socketMeta.get(socket.id);
       if (!meta) return;
@@ -1421,7 +2027,8 @@
       const set = userSockets.get(meta.userId);
       if (set) {
         set.delete(socket.id);
-        if (set.size === 0) { 
+        if (set.size === 0) {
+          clearDriverRideState(meta.userId);
           userSockets.delete(meta.userId);
           await setPresence(meta.userId, false, false);
         }
@@ -1496,57 +2103,102 @@
       event, user_ids || 'all connected', refresh_drivers || false);
 
     try {
-      if (user_ids && Array.isArray(user_ids) && user_ids.length > 0) {
-        // Broadcast to specific users
+      const skipRawEmit = refresh_drivers && RIDE_LIST_REFRESH_EVENTS.has(event);
+
+      if (skipRawEmit) {
+        console.log("[socket] ↷ Skipping raw emit for %s — will send driver:nearby-rides:list only", event);
+      } else if (user_ids && Array.isArray(user_ids) && user_ids.length > 0) {
+        // Broadcast to specific users — room + direct socket (same as first ride)
         let sentCount = 0;
-        user_ids.forEach(userId => {
+        const sockets = await io.fetchSockets();
+
+        for (const userId of user_ids) {
           const count = getUserOnlineCount(userId);
-          if (count > 0) {
-            io.to(`user:${userId}`).emit(event, data || {});
+          io.to(`user:${userId}`).emit(event, data || {});
+
+          let directCount = 0;
+          for (const sock of sockets) {
+            const meta = socketMeta.get(sock.id);
+            if (!meta || Number(meta.userId) !== Number(userId)) continue;
+            sock.emit(event, data || {});
+            directCount++;
+          }
+
+          if (count > 0 || directCount > 0) {
             sentCount++;
-            console.log("[socket] ✓ Sent event=%s to user_id=%s (connections=%d)", event, userId, count);
+            if (event === "driver:nearby-rides:list" && Number(data?.count) > 0) {
+              lockDriverRideShow(userId, data.data || [], "driver:nearby-rides:list");
+            }
+            console.log(
+              "[socket] ✓ Sent event=%s to user_id=%s (connections=%d direct=%d count=%s hidden=%s ride_id=%s)",
+              event,
+              userId,
+              count,
+              directCount,
+              data?.count,
+              data?.hidden,
+              data?.data?.[0]?.id ?? data?.data?.[0]?.ride_id ?? data?.ride_id ?? null
+            );
           } else {
             console.log("[socket] ⚠ Skipped user_id=%s (offline)", userId);
           }
-        });
-        
-        // Auto-refresh all online drivers if refresh_drivers flag is set
-        if (refresh_drivers) {
-          console.log("[socket] 🔄 Auto-refreshing online drivers' nearby rides list");
-          const driverRefreshCount = await refreshConnectedDriverSockets(data, event);
-          console.log("[socket] ✓ Refreshed nearby rides for %d online drivers", driverRefreshCount);
         }
-        
-        return res.json({ 
-          ok: true, 
+
+        if (refresh_drivers) {
+          console.log("[socket] 🔄 Building driver:nearby-rides:list for online drivers");
+          const driverRefreshCount = await refreshConnectedDriverSockets(data, event);
+          console.log("[socket] ✓ driver:nearby-rides:list sent to %d drivers", driverRefreshCount);
+        }
+
+        return res.json({
+          ok: true,
           event,
           targeted_users: user_ids.length,
-          sent_to: sentCount,
+          sent_to: skipRawEmit ? 0 : sentCount,
           drivers_refreshed: refresh_drivers ? 'yes' : 'no',
-          message: `Event sent to ${sentCount}/${user_ids.length} online users`
+          message: refresh_drivers
+            ? `driver:nearby-rides:list refreshed for online drivers`
+            : `Event sent to ${sentCount}/${user_ids.length} online users`,
         });
-      } else {
+      } else if (!skipRawEmit) {
         // Broadcast to all connected clients
         io.emit(event, data || {});
         const totalConnections = io.engine.clientsCount;
         console.log("[socket] ✓ Broadcast event=%s to all clients (count=%d)", event, totalConnections);
-        
-        // Auto-refresh all drivers if refresh_drivers flag is set
+
         if (refresh_drivers) {
-          console.log("[socket] 🔄 Auto-refreshing online drivers' nearby rides list");
+          console.log("[socket] 🔄 Building driver:nearby-rides:list for online drivers");
           const driverRefreshCount = await refreshConnectedDriverSockets(data, event);
-          console.log("[socket] ✓ Refreshed nearby rides for %d online drivers", driverRefreshCount);
+          console.log("[socket] ✓ driver:nearby-rides:list sent to %d drivers", driverRefreshCount);
         }
-        
-        return res.json({ 
-          ok: true, 
+
+        return res.json({
+          ok: true,
           event,
           broadcast: 'all',
           total_connections: totalConnections,
           drivers_refreshed: refresh_drivers ? 'yes' : 'no',
-          message: `Event broadcast to all connected clients`
+          message: refresh_drivers
+            ? `driver:nearby-rides:list refreshed for online drivers`
+            : `Event broadcast to all connected clients`,
         });
       }
+
+      if (refresh_drivers) {
+        console.log("[socket] 🔄 Building driver:nearby-rides:list for online drivers");
+        const driverRefreshCount = await refreshConnectedDriverSockets(data, event);
+        console.log("[socket] ✓ driver:nearby-rides:list sent to %d drivers", driverRefreshCount);
+
+        return res.json({
+          ok: true,
+          event: "driver:nearby-rides:list",
+          drivers_refreshed: 'yes',
+          drivers_count: driverRefreshCount,
+          message: `driver:nearby-rides:list sent to ${driverRefreshCount} drivers`,
+        });
+      }
+
+      return res.json({ ok: true, event, message: "No action taken" });
     } catch (error) {
       console.error("[socket] ✗ Broadcast error:", error.message);
       return res.status(500).json({ ok: false, message: error.message });

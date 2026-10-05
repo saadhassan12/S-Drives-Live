@@ -16,11 +16,8 @@ class ClearCache
      */
     public function handle(Request $request, Closure $next): Response
     {
-        // Do not wipe ride visibility cache on read-only driver polling.
-        if (!$request->isMethod('GET')) {
-            Artisan::call('cache:clear');
-        }
-
+        // Never wipe application cache here — it destroys per-driver ride visibility
+        // and pending fare-update keys needed for repeat fare increases.
         if (!$request->is('api/driver/near/by/ride')) {
             Artisan::call('config:clear');
             Artisan::call('route:clear');

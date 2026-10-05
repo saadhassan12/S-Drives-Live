@@ -177,9 +177,13 @@ if (!function_exists('send_driver_fare_update_notification')) {
     /**
      * Fare updates must reach drivers even when the app is open in foreground.
      */
-    function send_driver_fare_update_notification($driver, $title, $body)
+    function send_driver_fare_update_notification($driver, $title, $body, array $data = [])
     {
         if (!$driver || $driver->role !== 'driver' || (int) $driver->last_login_at !== 1) {
+            return false;
+        }
+
+        if ((int) ($driver->is_app_foreground ?? 0) === 1) {
             return false;
         }
 
@@ -187,7 +191,14 @@ if (!function_exists('send_driver_fare_update_notification')) {
             return false;
         }
 
-        return send_firebase_notification($title, $body, $driver->device_token, $driver);
+        // Always send — foreground push triggers app refresh when socket UI ignores re-show
+        try {
+            $notification = new FirebasePushNotification($title, $body, $driver->device_token, $data);
+            return $notification->toFirebase();
+        } catch (\Exception $e) {
+            Log::error('Firebase Fare Update Notification Error: ' . $e->getMessage());
+            return false;
+        }
     }
 }
 

@@ -19,6 +19,7 @@ class BidController extends Controller
             'time' => 'required|string',
         ]);
 
+        $rideId = resolve_ride_id($rideId);
         $ride = Ride::findOrFail($rideId);
         $passenger = User::find($ride->user_id);
 

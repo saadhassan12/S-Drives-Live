@@ -102,7 +102,7 @@ if (!function_exists('is_ride_visible_for_driver')) {
  * @return bool Success status
  */
 if (!function_exists('notify_drivers_new_ride')) {
-    function notify_drivers_new_ride(array $driverIds, array $rideData, bool $resetVisibility = false): bool
+    function notify_drivers_new_ride(array $driverIds, array $rideData, bool $resetVisibility = false, ?int $visibilitySeconds = null): bool
     {
         $driverIds = array_values(array_unique(array_map('intval', $driverIds)));
 
@@ -112,28 +112,93 @@ if (!function_exists('notify_drivers_new_ride')) {
 
         if (!empty($rideData['ride_id'])) {
             remember_ride_notified_drivers((int) $rideData['ride_id'], $driverIds);
-            mark_ride_visible_for_drivers($driverIds, (int) $rideData['ride_id'], ride_visibility_seconds());
+            $seconds = $visibilitySeconds ?? ride_visibility_seconds();
+            mark_ride_visible_for_drivers($driverIds, (int) $rideData['ride_id'], $seconds);
         }
 
         $socketDriverIds = get_online_driver_ids_for_socket($driverIds);
+
+        $rideForApp = $rideData;
+        unset($rideForApp['fare_updated']);
+
+        $rideId = (int) ($rideData['ride_id'] ?? $rideData['id'] ?? 0);
+
+        // Fare update: same event as first ride, but a NEW id so the app cannot
+        // treat it as the already-hidden request.
+        if (!empty($rideData['fare_updated']) && $rideId > 0) {
+            $displayId = (int) ($rideData['socket_display_id'] ?? 0);
+            if ($displayId <= 0) {
+                $displayId = allocate_socket_reshow_ride_id($rideId);
+            }
+            unset($rideForApp['socket_display_id'], $rideForApp['original_ride_id']);
+            $rideForApp['id'] = $displayId;
+            $rideForApp['ride_id'] = $displayId;
+
+            $seconds = $visibilitySeconds ?? ride_visibility_seconds();
+
+            $listPayload = [
+                'success' => true,
+                'data' => [$rideForApp],
+                'count' => 1,
+                'hidden' => false,
+                'timestamp' => now()->toIso8601String(),
+                'show_token' => $displayId . '-' . (int) round(microtime(true) * 1000),
+                'visibility_seconds' => $seconds,
+            ];
+
+            return broadcast_socket_event('driver:nearby-rides:list', $listPayload, $driverIds, false);
+        }
 
         if (empty($socketDriverIds)) {
             return false;
         }
 
         $eventData = [
-            'ride' => $rideData,
-            'message' => 'New ride available nearby',
+            'ride' => $rideForApp,
+            'ride_details' => $rideForApp,
+            'forced_rides' => [$rideForApp],
+            'eligible_driver_ids' => $driverIds,
+            'previously_notified_driver_ids' => get_ride_previously_notified_driver_ids(
+                (int) ($rideData['ride_id'] ?? $rideData['id'] ?? 0)
+            ),
+            'message' => !empty($rideData['fare_updated'])
+                ? 'Updated fare ride available nearby'
+                : 'New ride available nearby',
         ];
 
         if ($resetVisibility && !empty($rideData['ride_id'])) {
             $eventData['ride_id'] = (int) $rideData['ride_id'];
-            $eventData['visibility_seconds'] = ride_visibility_seconds();
+            $eventData['visibility_seconds'] = $visibilitySeconds ?? ride_visibility_seconds();
             $eventData['visibility_reset'] = true;
+            $eventData['fare_updated'] = !empty($rideData['fare_updated']);
             $eventData['reason'] = !empty($rideData['fare_updated']) ? 'fare_updated' : 'ride_updated';
         }
 
-        return broadcast_socket_event('driver:new-ride-available', $eventData, $socketDriverIds, true);
+        $listPayload = [
+            'success' => true,
+            'data' => [$rideForApp],
+            'count' => 1,
+            'hidden' => false,
+            'timestamp' => now()->toIso8601String(),
+            'show_token' => $rideId . '-' . (int) round(microtime(true) * 1000),
+            'visibility_seconds' => ride_visibility_seconds(),
+        ];
+
+        return broadcast_socket_event('driver:nearby-rides:list', $listPayload, $socketDriverIds, false)
+            && broadcast_socket_event('driver:new-ride-available', [
+                'ride' => $rideForApp,
+                'ride_id' => $rideId,
+                'id' => $rideId,
+                'ride_details' => $rideForApp,
+                'start' => $rideForApp['start'] ?? null,
+                'destination' => $rideForApp['destination'] ?? null,
+                'estimated_fare' => $rideForApp['estimated_fare'] ?? $rideForApp['final_fare'] ?? null,
+                'final_fare' => $rideForApp['final_fare'] ?? $rideForApp['estimated_fare'] ?? null,
+                'vehicle_category_id' => $rideForApp['vehicle_category_id'] ?? null,
+                'status' => $rideForApp['status'] ?? null,
+                'message' => 'New ride available nearby',
+            ], $socketDriverIds, false)
+            && broadcast_socket_event('driver:nearby-rides:list', $eventData, $socketDriverIds, true);
     }
 }
 
@@ -160,12 +225,14 @@ if (!function_exists('refresh_all_drivers_list')) {
             $payload['fare_updated'] = !empty($rideData['fare_updated']);
             $payload['eligible_driver_ids'] = $rideData['eligible_driver_ids'] ?? [];
             $payload['ride_details'] = $rideData['ride_details'] ?? null;
+            $payload['forced_rides'] = $rideData['forced_rides']
+                ?? (!empty($rideData['ride_details']) ? [$rideData['ride_details']] : []);
             $payload['reason'] = !empty($rideData['fare_updated'])
                 ? 'fare_updated'
                 : ($action === 'bid_placed' ? 'bid_placed' : 'ride_updated');
         }
 
-        return broadcast_socket_event('driver:rides-list-updated', $payload, null, true);
+        return broadcast_socket_event('driver:nearby-rides:list', $payload, null, true);
     }
 }
 
@@ -198,7 +265,7 @@ if (!function_exists('notify_passenger_ride_update')) {
 if (!function_exists('ride_visibility_seconds')) {
     function ride_visibility_seconds(): int
     {
-        return max(10, (int) config('ride.visibility_seconds', 60));
+        return max(60, (int) config('ride.visibility_seconds', 60));
     }
 }
 

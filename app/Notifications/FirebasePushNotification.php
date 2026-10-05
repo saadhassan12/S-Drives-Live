@@ -11,12 +11,14 @@ class FirebasePushNotification extends Notification
     private $title;
     private $body;
     private $deviceToken;
+    private $data;
 
-    public function __construct($title, $body, $deviceToken)
+    public function __construct($title, $body, $deviceToken, array $data = [])
     {
         $this->title = $title;
         $this->body = $body;
         $this->deviceToken = $deviceToken;
+        $this->data = $data;
     }
 
     public function via($notifiable)
@@ -76,6 +78,10 @@ public function toFirebase()
             ],
         ],
     ];
+
+    if (!empty($this->data)) {
+        $payload['message']['data'] = array_map('strval', $this->data);
+    }
 
     try {
         $response = $client->post($url, [

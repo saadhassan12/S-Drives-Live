@@ -391,12 +391,12 @@ public function near_ride()
 {
     $user = auth()->user();
     if ($user->role !== 'driver') {
-        return response()->json(['error' => 'Unauthorized'], 403);
+        return apiResponse([], 'Unauthorized', 403, false);
     }
 
     $vehicle = Vehicles::where('user_id', $user->id)->first();
     if (!$vehicle) {
-        return response()->json(['error' => 'Vehicle not found for this driver'], 404);
+        return apiResponse([], 'Vehicle not found for this driver', 200, false);
     }
 
     $driverVehicleCategoryId = $vehicle->vehicle_category_id;
@@ -414,64 +414,88 @@ public function near_ride()
     $driverLatitude = $user->latitude;
     $driverLongitude = $user->longitude;
     $radiusKm = driver_ride_radius_km();
+    $hasLocation = $driverLatitude !== null && $driverLongitude !== null;
 
-    [$minLat, $maxLat, $minLng, $maxLng] = $this->getNearbyBounds($driverLatitude, $driverLongitude, $radiusKm);
+    $ridesToUpdate = collect();
 
-    $ridesToUpdate = Ride::whereIn('vehicle_category_id', $allowedCategories)
-        ->whereBetween('start_latitude', [$minLat, $maxLat])
-        ->whereBetween('start_longitude', [$minLng, $maxLng])
-        ->whereIn('status', ['requested', 'in_progress'])
-        ->where('time_out', 0)
-        ->where('created_at', '>=', $today->copy()->startOfDay())
-        ->with(['user', 'vehicleCategory'])
-        ->get()
-        ->map(function ($ride) use ($driverLatitude, $driverLongitude, $radiusKm) {
-            $distanceKm = calculate_geo_distance_km(
-                (float) $driverLatitude,
-                (float) $driverLongitude,
-                (float) $ride->start_latitude,
-                (float) $ride->start_longitude
-            );
+    if ($hasLocation) {
+        [$minLat, $maxLat, $minLng, $maxLng] = $this->getNearbyBounds(
+            (float) $driverLatitude,
+            (float) $driverLongitude,
+            $radiusKm
+        );
 
-            $ride->driver_distance_km = round($distanceKm, 2);
-            $ride->max_radius_km = $radiusKm;
+        $ridesToUpdate = Ride::whereIn('vehicle_category_id', $allowedCategories)
+            ->whereBetween('start_latitude', [$minLat, $maxLat])
+            ->whereBetween('start_longitude', [$minLng, $maxLng])
+            ->whereIn('status', ['requested', 'in_progress'])
+            ->where('time_out', 0)
+            ->where('created_at', '>=', $today->copy()->startOfDay())
+            ->with(['user', 'vehicleCategory'])
+            ->get()
+            ->map(function ($ride) use ($driverLatitude, $driverLongitude, $radiusKm) {
+                $distanceKm = calculate_geo_distance_km(
+                    (float) $driverLatitude,
+                    (float) $driverLongitude,
+                    (float) $ride->start_latitude,
+                    (float) $ride->start_longitude
+                );
 
-            return $ride;
-        })
-        ->filter(function ($ride) use ($radiusKm, $user) {
-            if ($ride->driver_distance_km > $radiusKm) {
-                return false;
-            }
+                $ride->driver_distance_km = round($distanceKm, 2);
+                $ride->max_radius_km = $radiusKm;
 
-            // Show for configured window after create / fare update / bid, or per-driver cache reset
-            $visibleByTime = $ride->updated_at
-                && $ride->updated_at->gte(now()->subSeconds(ride_visibility_seconds()));
-            $visibleByCache = is_ride_visible_for_driver((int) $user->id, (int) $ride->id);
+                return $ride;
+            })
+            ->filter(function ($ride) use ($radiusKm, $user) {
+                if ($ride->driver_distance_km > $radiusKm) {
+                    return false;
+                }
 
-            return $visibleByTime || $visibleByCache;
-        })
-        ->values();
+                $visibleByTime = $ride->updated_at
+                    && $ride->updated_at->gte(now()->subSeconds(ride_visibility_seconds()));
+                $visibleByCache = is_ride_visible_for_driver((int) $user->id, (int) $ride->id);
+
+                return $visibleByTime || $visibleByCache;
+            })
+            ->values();
+    }
+
+    $pendingFare = Cache::get("driver_{$user->id}_pending_fare_ride");
+    $pendingOriginalId = (int) ($pendingFare['ride_id'] ?? 0);
+    $pendingDisplayId = (int) ($pendingFare['display_id'] ?? 0);
+
+    $ridesToUpdate = $ridesToUpdate->map(function ($ride) use ($pendingOriginalId, $pendingDisplayId) {
+        if ($pendingDisplayId > 0 && (int) $ride->id === $pendingOriginalId) {
+            $row = $ride->toArray();
+            $row['id'] = $pendingDisplayId;
+            $row['ride_id'] = $pendingDisplayId;
+            $row['fare_updated'] = true;
+
+            return (object) $row;
+        }
+
+        return $ride;
+    })->values();
 
     $pendingFareRides = collect(get_pending_fare_rides_for_driver((int) $user->id))
-        ->map(function ($ride) use ($driverLatitude, $driverLongitude, $radiusKm, $user) {
+        ->map(function ($ride) use ($driverLatitude, $driverLongitude, $radiusKm, $hasLocation) {
             if (is_array($ride)) {
                 $ride = (object) $ride;
             }
 
-            $rideLat = (float) ($ride->start_latitude ?? 0);
-            $rideLng = (float) ($ride->start_longitude ?? 0);
-            $distanceKm = calculate_geo_distance_km(
-                (float) $driverLatitude,
-                (float) $driverLongitude,
-                $rideLat,
-                $rideLng
-            );
+            if ($hasLocation) {
+                $rideLat = (float) ($ride->start_latitude ?? 0);
+                $rideLng = (float) ($ride->start_longitude ?? 0);
+                $distanceKm = calculate_geo_distance_km(
+                    (float) $driverLatitude,
+                    (float) $driverLongitude,
+                    $rideLat,
+                    $rideLng
+                );
 
-            if ($distanceKm > $radiusKm) {
-                return null;
+                $ride->driver_distance_km = round($distanceKm, 2);
             }
 
-            $ride->driver_distance_km = round($distanceKm, 2);
             $ride->max_radius_km = $radiusKm;
             $ride->fare_updated = true;
 
@@ -491,6 +515,10 @@ public function near_ride()
     }
 
     if ($ridesToUpdate->isNotEmpty()) {
+        foreach ($ridesToUpdate as $visibleRide) {
+            remember_ride_notified_drivers(resolve_ride_id((int) $visibleRide->id), [(int) $user->id]);
+        }
+
         return apiResponse($ridesToUpdate->values(), 'Nearby rides fetched successfully.', 200);
     }
 
@@ -542,7 +570,7 @@ public function near_ride()
     
      public function driverreach(Request $request, $rideId)
     {
-        $ride = Ride::findOrFail($rideId);
+        $ride = Ride::findOrFail(resolve_ride_id($rideId));
         $ride->driver_id = auth()->id();
         $ride->status = 'driver_reach';
         $ride->save();
@@ -561,7 +589,7 @@ public function near_ride()
     
        public function startedride(Request $request, $rideId)
     {
-        $ride = Ride::findOrFail($rideId);
+        $ride = Ride::findOrFail(resolve_ride_id($rideId));
         $ride->driver_id = auth()->id();
         $ride->status = 'started_ride';
         $ride->save();
@@ -587,7 +615,7 @@ public function near_ride()
 
           public function pickride(Request $request, $rideId)
         {
-            $ride = Ride::findOrFail($rideId);
+            $ride = Ride::findOrFail(resolve_ride_id($rideId));
             $ride->driver_id = auth()->id();
             $ride->status = 'ride_pick';
             $ride->save();
@@ -676,7 +704,7 @@ public function near_ride()
     
  public function completeRidesby($rideId)
 {
-    $ride = Ride::findOrFail($rideId);
+    $ride = Ride::findOrFail(resolve_ride_id($rideId));
 
     // Sirf driver ya passenger hi ride complete kar sakta hai
     if ($ride->driver_id != auth()->id() && $ride->user_id != auth()->id()) {
