@@ -36,6 +36,16 @@ public function getOtp(Request $request)
         $mobile_number = '+92' . substr($mobile_number, 1);
     }
 
+    // Already verified users log in with the number only: no SMS, token returned directly.
+    $verifiedUser = User::withTrashed()->where('mobile_number', $mobile_number)->first();
+    if ($verifiedUser && $verifiedUser->is_verified) {
+        if ($verifiedUser->trashed()) {
+            return apiResponse(null, 'Your account has been deleted. Please contact admin for assistance.', 403);
+        }
+
+        return $this->loginUser($verifiedUser, $request->input('device_token'), 'Login successful.');
+    }
+
     // ? Define your special test numbers
     $special_numbers = [
         '+923022222222',
@@ -162,30 +172,7 @@ public function getOtp(Request $request)
                     return apiResponse(null, 'Your account has been deleted. Please contact admin for assistance.', 403);
                 }
 
-                // Same number se naya login — purani session auto logout.
-                $user->tokens()->where('revoked', false)->update(['revoked' => true]);
-
-                DB::table('login_histories')
-                    ->where('user_id', $user->id)
-                    ->whereNull('logout_time')
-                    ->update(['logout_time' => now()]);
-
-                $token = $user->createToken('Api Token')->accessToken;
-                $user->device_token = $request->device_token ?? 'default_token';
-                $user->is_online = true;
-                $user->save();
-
-                if ((int) $user->last_login_at === 1 && $user->role === 'driver') {
-                    DB::table('login_histories')->insert([
-                        'user_id' => $user->id,
-                        'login_time' => now(),
-                    ]);
-                }
-
-                return apiResponse(
-                    ['user' => $user->fresh(), 'token' => $token],
-                    'OTP verified successfully.'
-                );
+                return $this->loginUser($user, $request->device_token, 'OTP verified successfully.');
             } else {
                 return apiResponse(
                     null,
@@ -197,6 +184,34 @@ public function getOtp(Request $request)
             return apiResponse(null, 'Invalid OTP', 400);
         }
     }
+    private function loginUser(User $user, $deviceToken, string $message)
+    {
+        // Same number se naya login — purani session auto logout.
+        $user->tokens()->where('revoked', false)->update(['revoked' => true]);
+
+        DB::table('login_histories')
+            ->where('user_id', $user->id)
+            ->whereNull('logout_time')
+            ->update(['logout_time' => now()]);
+
+        $token = $user->createToken('Api Token')->accessToken;
+        $user->device_token = $deviceToken ?? 'default_token';
+        $user->is_online = true;
+        $user->save();
+
+        if ((int) $user->last_login_at === 1 && $user->role === 'driver') {
+            DB::table('login_histories')->insert([
+                'user_id' => $user->id,
+                'login_time' => now(),
+            ]);
+        }
+
+        return apiResponse(
+            ['user' => $user->fresh(), 'token' => $token, 'otp_required' => false],
+            $message
+        );
+    }
+
     public function signup(Request $request)
     {
 

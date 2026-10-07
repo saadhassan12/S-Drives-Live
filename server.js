@@ -689,6 +689,96 @@
     console.log("[socket] ⏱ Ride hidden (server-side) user_id=%s", userId);
   }
 
+  // Ride no longer available to drivers (canceled / accepted / finished).
+  const RIDE_REMOVAL_ACTIONS = new Set(["ride_canceled", "bid_accepted"]);
+  const RIDE_OPEN_STATUSES = new Set(["requested", "in_progress"]);
+
+  function isRideRemovalBroadcast(data) {
+    if (!data) return false;
+    if (RIDE_REMOVAL_ACTIONS.has(data.action)) return true;
+    const status = data.ride && data.ride.status;
+    return !!status && !RIDE_OPEN_STATUSES.has(String(status));
+  }
+
+  function rideKey(ride) {
+    const id = ride?.id ?? ride?.ride_id;
+    return id == null ? null : String(id);
+  }
+
+  // Ride ids Laravel still returns for this driver; null when the API cannot be reached.
+  async function fetchLiveRideKeysForDriver(userId) {
+    const sockets = await io.fetchSockets();
+    for (const sock of sockets) {
+      const meta = socketMeta.get(sock.id);
+      if (!meta || Number(meta.userId) !== Number(userId) || !meta.token) {
+        continue;
+      }
+
+      try {
+        const raw = await laravelFetch("/api/driver/near/by/ride", {
+          method: "GET",
+          headers: { Authorization: `Bearer ${meta.token}` },
+        });
+        const rides = Array.isArray(raw?.data) ? raw.data : [];
+        return new Set(rides.map(rideKey).filter((key) => key !== null));
+      } catch (error) {
+        console.error(
+          "[socket] ✗ fetchLiveRideKeysForDriver user_id=%s failed: %s",
+          userId,
+          error.message
+        );
+      }
+    }
+
+    return null;
+  }
+
+  // Drop closed rides from every driver's locked list so keep-alive stops
+  // re-sending a ride the API no longer returns.
+  async function purgeClosedRidesFromDrivers(data) {
+    const closedRideId = getRideIdFromBroadcast(data);
+    const reason = data?.action || "ride_closed";
+    let purgedCount = 0;
+
+    for (const [userId, state] of driverRideState) {
+      const locked = Array.isArray(state.lastRides) ? state.lastRides : [];
+      if (locked.length === 0) continue;
+
+      const liveKeys = await fetchLiveRideKeysForDriver(userId);
+      const kept = locked.filter((ride) => {
+        const key = rideKey(ride);
+        if (liveKeys) return key !== null && liveKeys.has(key);
+        return closedRideId == null || key !== String(closedRideId);
+      });
+
+      if (kept.length === locked.length) continue;
+      purgedCount++;
+
+      if (kept.length === 0) {
+        await hideDriverRidesNow(userId, true);
+        const payload = {
+          ...buildFreshRideShowPayload([], { hidden: true, reason }),
+          ride_id: closedRideId,
+        };
+        await emitToDriver(userId, "driver:nearby-rides:list", payload);
+        await emitToDriver(userId, "driver:nearby-rides:result", payload);
+      } else {
+        state.lastRides = kept;
+        await emitNearbyRidesListShow(userId, kept, reason);
+      }
+
+      console.log(
+        "[socket] 🧹 Removed closed ride from driver list user_id=%s ride_id=%s reason=%s remaining=%d",
+        userId,
+        closedRideId,
+        reason,
+        kept.length
+      );
+    }
+
+    return purgedCount;
+  }
+
   async function fetchNearbyRidesForDriver(userId, forceRides = []) {
     const sockets = await io.fetchSockets();
     for (const sock of sockets) {
@@ -2104,6 +2194,20 @@
 
     try {
       const skipRawEmit = refresh_drivers && RIDE_LIST_REFRESH_EVENTS.has(event);
+
+      // Canceled / accepted ride: remove it from driver lists, never re-show it.
+      if (skipRawEmit && isRideRemovalBroadcast(data)) {
+        const purgedCount = await purgeClosedRidesFromDrivers(data);
+        console.log("[socket] ✓ closed ride removed from %d driver lists", purgedCount);
+
+        return res.json({
+          ok: true,
+          event: "driver:nearby-rides:list",
+          drivers_refreshed: 'yes',
+          drivers_count: purgedCount,
+          message: `closed ride removed from ${purgedCount} driver lists`,
+        });
+      }
 
       if (skipRawEmit) {
         console.log("[socket] ↷ Skipping raw emit for %s — will send driver:nearby-rides:list only", event);

@@ -129,6 +129,11 @@ public function updateBooking(Request $request, $id)
         return apiResponse(null, 'Ride not found', 404);
     }
 
+    // A ride a driver already accepted must not be reset to searching.
+    if (in_array($ride->status, ['accepted', 'driver_reach', 'ride_pick', 'started_ride', 'completed'], true)) {
+        return apiResponse($ride, 'Ride is already accepted by a driver.', 200, false);
+    }
+
     // ? Calculate distance
     $distance = $this->calculateDistance(
         $ride->start_latitude,

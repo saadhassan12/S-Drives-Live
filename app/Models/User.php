@@ -29,6 +29,7 @@ class User extends Authenticatable
         'date_of_birth',
         'mobile_number',
         'otp_verified_at',
+        'is_verified',
         'email',
         'profile_image',
         'latitude',

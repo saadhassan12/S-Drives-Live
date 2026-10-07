@@ -26,11 +26,11 @@ class RideAutoCancelService
 
         Ride::query()
             ->whereIn('status', self::PENDING_STATUSES)
-            ->where('created_at', '<=', $cutoff)
+            ->where('updated_at', '<=', $cutoff)
             ->orderBy('id')
-            ->chunkById(50, function ($rides) use (&$cancelled, $timeoutMinutes) {
+            ->chunkById(50, function ($rides) use (&$cancelled, $timeoutMinutes, $cutoff) {
                 foreach ($rides as $ride) {
-                    if ($this->cancelRide($ride, $timeoutMinutes, false)) {
+                    if ($this->cancelRide($ride, $timeoutMinutes, false, $cutoff)) {
                         $cancelled++;
                     }
                 }
@@ -46,13 +46,27 @@ class RideAutoCancelService
         return $cancelled;
     }
 
-    public function cancelRide(Ride $ride, ?int $timeoutMinutes = null, bool $refreshDrivers = true): bool
+    public function cancelRide(Ride $ride, ?int $timeoutMinutes = null, bool $refreshDrivers = true, $cutoff = null): bool
     {
         $timeoutMinutes = $timeoutMinutes ?? self::TIMEOUT_MINUTES;
 
         if (! in_array($ride->status, self::PENDING_STATUSES, true)) {
             return false;
         }
+
+        // Cancel in one query against the live row, so a ride a driver accepted
+        // (or the passenger just re-sent) a moment ago is never canceled.
+        $canceled = Ride::query()
+            ->whereKey($ride->id)
+            ->whereIn('status', self::PENDING_STATUSES)
+            ->when($cutoff, fn ($query) => $query->where('updated_at', '<=', $cutoff))
+            ->update(['status' => 'canceled', 'updated_at' => now()]);
+
+        if ($canceled === 0) {
+            return false;
+        }
+
+        $ride->refresh();
 
         $reason = "Auto-canceled: no driver accepted within {$timeoutMinutes} minutes.";
 
@@ -62,9 +76,6 @@ class RideAutoCancelService
             'reason' => $reason,
             'canceled_by' => 'passenger',
         ]);
-
-        $ride->status = 'canceled';
-        $ride->save();
 
         Bid::where('ride_id', $ride->id)
             ->where('status', 'pending')
@@ -115,7 +126,7 @@ class RideAutoCancelService
 
         return Ride::query()
             ->whereIn('status', self::PENDING_STATUSES)
-            ->where('created_at', '<=', $cutoff)
+            ->where('updated_at', '<=', $cutoff)
             ->get();
     }
 }
