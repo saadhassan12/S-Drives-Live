@@ -13,6 +13,7 @@ use App\Http\Controllers\SocketController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 use App\Http\Middleware\AutoLogout;
+use App\Http\Controllers\RideHistoryController;
 use App\Http\Middleware\ClearCache;
 //user
 Route::controller(UserController::class)->middleware([AutoLogout::class])->group(function(){
@@ -43,6 +44,7 @@ Route::controller(SocketController::class)->middleware(['auth:api'])->group(func
 Route::controller(SocketController::class)->group(function () {
     Route::post('/socket/internal/presence', 'updatePresence');
     Route::post('/socket/internal/activity', 'touchActivity');
+    Route::post('/socket/internal/driver-location', 'driverLocation');
 });
 // passenger / driver mode
 Route::controller(ModeController::class)->middleware(['auth:api', AutoLogout::class])->group(function () {
@@ -52,6 +54,11 @@ Route::controller(ModeController::class)->middleware(['auth:api', AutoLogout::cl
     Route::post('/driver-mode', 'drivermood');
 });
 //driver
+Route::controller(RideHistoryController::class)->middleware(['auth:api', AutoLogout::class])->group(function () {
+    Route::get('/driver/rides/history', 'driver');
+    Route::get('/ride/history', 'user');
+});
+
 Route::controller(DriverController::class)
     ->middleware(['auth:api', AutoLogout::class, 'clearcache'])
     ->group(function () {

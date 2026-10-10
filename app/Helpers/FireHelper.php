@@ -65,10 +65,11 @@ if (!function_exists('can_driver_receive_ride_notifications')) {
             return false;
         }
 
+        // The app's "foreground" flag is unreliable (a backgrounded app keeps polling the API and
+        // keeps its socket open), so a ride request push is never skipped because of it.
         return $user->role === 'driver'
             && (int) $user->last_login_at === 1
-            && is_valid_device_token($user->device_token)
-            && should_send_push_notification($user);
+            && is_valid_device_token($user->device_token);
     }
 }
 
@@ -134,23 +135,41 @@ if (!function_exists('nearby_active_driver_query')) {
 }
 
 if (!function_exists('send_firebase_notification')) {
-    function send_firebase_notification($title, $body, $deviceToken, $user = null)
+    function send_firebase_notification($title, $body, $deviceToken, $user = null, array $data = [], bool $force = false)
     {
         if (!is_valid_device_token($deviceToken)) {
             return false;
         }
 
-        if (!$user) {
-            $user = User::where('device_token', $deviceToken)->first();
-        }
+        if (!$force) {
+            if (!$user) {
+                $user = User::where('device_token', $deviceToken)->first();
+            }
 
-        if ($user && !should_send_push_notification($user)) {
-            return false;
+            if ($user && !should_send_push_notification($user)) {
+                return false;
+            }
         }
 
         try {
-            $notification = new FirebasePushNotification($title, $body, $deviceToken);
-            return $notification->toFirebase();
+            $notification = new FirebasePushNotification($title, $body, $deviceToken, $data);
+            $result = $notification->toFirebase();
+
+            // A token FCM says is gone for good (app uninstalled / token rotated) can never receive
+            // a push: forget it so we stop wasting a request on it for every future ride.
+            if (is_array($result) && ($result['fcm_error'] ?? null) === 'UNREGISTERED') {
+                User::where('device_token', $deviceToken)->update(['device_token' => 'default_token']);
+            }
+
+            if (is_array($result) && isset($result['error'])) {
+                Log::warning('Firebase push failed', [
+                    'user_id' => $user->id ?? null,
+                    'error' => $result['error'],
+                    'details' => mb_substr((string) ($result['details'] ?? ''), 0, 300),
+                ]);
+            }
+
+            return $result;
         } catch (\Exception $e) {
             Log::error('Firebase Notification Error: ' . $e->getMessage());
             return false;
@@ -183,10 +202,6 @@ if (!function_exists('send_driver_fare_update_notification')) {
             return false;
         }
 
-        if ((int) ($driver->is_app_foreground ?? 0) === 1) {
-            return false;
-        }
-
         if (!is_valid_device_token($driver->device_token)) {
             return false;
         }
@@ -203,12 +218,12 @@ if (!function_exists('send_driver_fare_update_notification')) {
 }
 
 if (!function_exists('send_driver_ride_notification')) {
-    function send_driver_ride_notification($driver, $title, $body)
+    function send_driver_ride_notification($driver, $title, $body, array $data = [])
     {
         if (!can_driver_receive_ride_notifications($driver)) {
             return false;
         }
 
-        return send_firebase_notification($title, $body, $driver->device_token, $driver);
+        return send_firebase_notification($title, $body, $driver->device_token, $driver, $data, true);
     }
 }

@@ -1046,6 +1046,10 @@
       await setPresence(userId, true, true);
     }
 
+    if (socket.data.user && socket.data.user.role === "driver") {
+      socket.join(`driver:${userId}`);
+    }
+
     socket.emit("socket:ready", {
       user_id: userId,
       room_ids: roomIds,
@@ -1844,6 +1848,66 @@
       }
     });
 
+    // Driver GPS: saved in Laravel, relayed to the passenger of the active ride and back to the driver.
+    socket.on("driver:location-update", async (payload, callback) => {
+      const reply = (body) => {
+        if (typeof callback === "function") callback(body);
+      };
+
+      try {
+        const latitude = Number(payload?.latitude);
+        const longitude = Number(payload?.longitude);
+        if (!socket.data.isDriver || !Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+          return reply({ ok: false, message: "Invalid driver location" });
+        }
+
+        const info = await laravelFetch("/api/socket/internal/driver-location", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-socket-secret": SOCKET_INTERNAL_SECRET,
+          },
+          body: JSON.stringify({
+            user_id: userId,
+            ride_id: payload?.ride_id ?? null,
+            latitude,
+            longitude,
+          }),
+        });
+
+        // No active ride (cancelled/completed/not assigned): location saved, nothing relayed.
+        if (!info?.active) {
+          return reply({ ok: true, relayed: false });
+        }
+
+        const updatedAt = new Date().toISOString();
+        const heading = payload?.heading ?? null;
+        const speed = payload?.speed ?? null;
+
+        io.to(`user:${info.passenger_id}`).emit("passenger:driver-location", {
+          ride_id: info.ride_id,
+          driver_id: info.driver_id,
+          latitude,
+          longitude,
+          heading,
+          speed,
+          updated_at: updatedAt,
+        });
+        io.to(`user:${info.driver_id}`).emit("driver:location-updated", {
+          ride_id: info.ride_id,
+          latitude,
+          longitude,
+          heading,
+          updated_at: updatedAt,
+        });
+
+        return reply({ ok: true, relayed: true });
+      } catch (error) {
+        console.error("[socket] ✗ driver:location-update user_id=%s: %s", userId, error.message);
+        return reply({ ok: false, message: error.message });
+      }
+    });
+
     socket.on("ride:cancel", async (payload, callback) => {
       console.log("[socket] ✓ ride:cancel listener TRIGGERED - user_id=%s", userId);
       const rideId = payload && (payload.ride_id || payload.rideId || payload.id);
@@ -2193,6 +2257,17 @@
       event, user_ids || 'all connected', refresh_drivers || false);
 
     try {
+      // Put both sides of a ride in ride:{id}; drop them when it is cancelled/completed.
+      const roomRideId = data?.ride_id ?? data?.ride?.ride_id ?? null;
+      if (roomRideId && Array.isArray(user_ids) && user_ids.length > 0 && event.startsWith("ride:")) {
+        const finished = event === "ride:cancelled" || event === "ride:completed";
+        for (const uid of user_ids) {
+          const sockets = io.in(`user:${uid}`);
+          if (finished) sockets.socketsLeave(`ride:${roomRideId}`);
+          else sockets.socketsJoin(`ride:${roomRideId}`);
+        }
+      }
+
       const skipRawEmit = refresh_drivers && RIDE_LIST_REFRESH_EVENTS.has(event);
 
       // Canceled / accepted ride: remove it from driver lists, never re-show it.

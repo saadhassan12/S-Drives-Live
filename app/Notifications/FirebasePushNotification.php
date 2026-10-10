@@ -13,6 +13,10 @@ class FirebasePushNotification extends Notification
     private $deviceToken;
     private $data;
 
+    /** Test seams only: a fake HTTP client / access token. Null in production. */
+    public static ?Client $httpClient = null;
+    public static ?string $accessTokenOverride = null;
+
     public function __construct($title, $body, $deviceToken, array $data = [])
     {
         $this->title = $title;
@@ -46,7 +50,7 @@ public function toFirebase()
     // ✅ Cache me 1 sec ke liye store karna
     cache()->put("fcm_sent_".$uniqueId, true, 30);
 
-    $client = new Client();
+    $client = static::$httpClient ?? new Client();
     $url = "https://fcm.googleapis.com/v1/projects/" . env('FCM_PROJECT_ID') . "/messages:send";
 
     $payload = [
@@ -71,6 +75,8 @@ public function toFirebase()
 
             'android' => [
             'priority' => 'high',
+            // A ride request that sat in a sleeping phone for minutes is useless: drop it after 2 minutes.
+            'ttl' => '120s',
                     'notification' => [
                         'sound' => 'custom_sound',
                         'channel_id' => 'high_importance_channel_custom',
@@ -97,6 +103,22 @@ public function toFirebase()
             'firebase_request' => $payload,
             'firebase_response' => json_decode($response->getBody(), true),
         ];
+    } catch (\GuzzleHttp\Exception\RequestException $e) {
+        $status = $e->getResponse() ? $e->getResponse()->getStatusCode() : null;
+        $body = $e->getResponse() ? json_decode((string) $e->getResponse()->getBody(), true) : null;
+
+        // An expired/revoked cached Google token: drop it so the next push fetches a fresh one.
+        if ($status === 401) {
+            \Illuminate\Support\Facades\Cache::forget('fcm_access_token');
+        }
+
+        return [
+            'error' => 'Notification failed',
+            'details' => $e->getMessage(),
+            'http_status' => $status,
+            // e.g. UNREGISTERED when the app was uninstalled / the token is dead for good
+            'fcm_error' => $body['error']['details'][0]['errorCode'] ?? $body['error']['status'] ?? null,
+        ];
     } catch (\Exception $e) {
         return [
             'error' => 'Notification failed',
@@ -112,10 +134,33 @@ public function toFirebase()
 
     private function getAccessToken()
     {
+        if (static::$accessTokenOverride !== null) {
+            return static::$accessTokenOverride;
+        }
+
+        // Google access tokens live 60 min; reusing one saves an OAuth round trip on every push.
+        $cached = \Illuminate\Support\Facades\Cache::get('fcm_access_token');
+        if ($cached) {
+            return $cached;
+        }
+
+        $token = $this->fetchAccessToken();
+        if ($token) {
+            \Illuminate\Support\Facades\Cache::put('fcm_access_token', $token, now()->addMinutes(50));
+        }
+
+        return $token;
+    }
+
+    private function fetchAccessToken()
+    {
         $serviceAccountPath = base_path(env('FCM_SERVICE_ACCOUNT_PATH'));
 
         if (!file_exists($serviceAccountPath)) {
-            dd("Firebase credentials file not found at: " . $serviceAccountPath);
+            // Never kill the request (dd) just because a push cannot be sent.
+            \Illuminate\Support\Facades\Log::error('Firebase credentials file not found at: ' . $serviceAccountPath);
+
+            return null;
         }
 
         $client = new Google_Client();

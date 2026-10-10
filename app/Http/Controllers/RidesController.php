@@ -104,12 +104,18 @@ class RidesController extends Controller
             'start_longitude' => $request->start_longitude,
             'end_latitude' => $request->end_latitude,
             'end_longitude' => $request->end_longitude,
-            'estimated_fare' => $vehicles->first()->calculated_fare,
             'start' => $request->start,
             'destination' => $request->destination,
-            'status' => 'requested',
             'created_at' => now(),
         ]);
+
+        // status and estimated_fare are not mass-assignable, so create() silently dropped them
+        // and the response had neither (estimated_fare stayed NULL in the DB).
+        $ride->forceFill([
+            'status' => 'requested',
+            'estimated_fare' => $vehicles->first()->calculated_fare,
+        ])->save();
+        $ride->refresh();
 
         return apiResponse([
             'ride' => $ride,
@@ -130,6 +136,10 @@ public function updateBooking(Request $request, $id)
     }
 
     // A ride a driver already accepted must not be reset to searching.
+    if ($ride->status === 'canceled') {
+        return apiResponse($ride, 'Ride is canceled. Please book a new ride.', 409, false);
+    }
+
     if (in_array($ride->status, ['accepted', 'driver_reach', 'ride_pick', 'started_ride', 'completed'], true)) {
         return apiResponse($ride, 'Ride is already accepted by a driver.', 200, false);
     }
@@ -224,6 +234,8 @@ public function updateBooking(Request $request, $id)
         );
     }
 
+    emit_ride_created($ride);
+
     $categoryIds = compatible_vehicle_category_ids((int) $vehicleCategory->id);
     $radiusKm = driver_ride_radius_km();
     $drivers = find_nearby_drivers_for_ride(
@@ -237,17 +249,28 @@ public function updateBooking(Request $request, $id)
         send_driver_ride_notification(
             $driver,
             'New Ride Available',
-            'A passenger nearby is requesting a ride. Accept now before it\'s gone.'
+            'A passenger nearby is requesting a ride. Accept now before it\'s gone.',
+            [
+                'type' => 'new_ride',
+                'action' => 'refresh_nearby_rides',
+                'ride_id' => (string) $ride->id,
+            ]
         );
     }
 
     $driverIds = $drivers->pluck('id')->toArray();
     if (!empty($driverIds)) {
-        notify_drivers_new_ride($driverIds, [
+        // Full ride (passenger, coordinates, vehicle category...) like GET driver/near/by/ride.
+        $rideDetails = Ride::with(['user', 'vehicleCategory'])->find($ride->id)?->toArray() ?? [];
+
+        notify_drivers_new_ride($driverIds, array_merge($rideDetails, [
             'ride_id' => $ride->id,
+            'id' => $ride->id,
             'start' => $ride->start,
             'destination' => $ride->destination,
             'estimated_fare' => $ride->estimated_fare,
+            'final_fare' => $ride->final_fare,
+            'fare' => ride_event_fare($ride),
             'distance' => $this->calculateDistance(
                 $ride->start_latitude,
                 $ride->start_longitude,
@@ -257,7 +280,7 @@ public function updateBooking(Request $request, $id)
             'vehicle_category_id' => $ride->vehicle_category_id,
             'status' => $ride->status,
             'max_radius_km' => $radiusKm,
-        ]);
+        ]));
     }
 
     return apiResponse($ride, 'Vehicle category and fare updated successfully, notifications sent to nearby drivers');
@@ -305,6 +328,29 @@ public function updateBooking(Request $request, $id)
         return apiResponse(null, 'Ride already canceled', 400);
     }
 
+    // A finished ride cannot be canceled. Every other state can be, otherwise a ride left open
+    // (e.g. the driver never pressed complete) stays on the passenger's screen forever.
+    if ($ride->status === 'completed') {
+        return apiResponse(
+            ['ride_id' => $ride->id, 'status' => ride_event_status($ride->status)],
+            'This ride is already completed and cannot be canceled.',
+            409,
+            false
+        );
+    }
+
+    // Who canceled which ride, from what state: lets us trace an unexpected cancel.
+    \Illuminate\Support\Facades\Log::info('Ride cancel requested', [
+        'ride_id' => $ride->id,
+        'status_before' => $ride->status,
+        'driver_id' => $ride->driver_id,
+        'by_user_id' => $user->id,
+        'role' => $user->role,
+        'ip' => $request->ip(),
+        'user_agent' => mb_substr((string) $request->userAgent(), 0, 80),
+        'seconds_since_update' => $ride->updated_at ? $ride->updated_at->diffInSeconds(now()) : null,
+    ]);
+
     $cancelData = CancelRide::create([
         'ride_id'     => $ride->id,
         'user_id'     => $user->id,
@@ -312,8 +358,11 @@ public function updateBooking(Request $request, $id)
         'canceled_by' => $user->role === 'driver' ? 'driver' : 'passenger',
     ]);
 
+$previousStatus = $ride->status;
 $ride->status = 'canceled';
 $ride->save();
+
+    emit_ride_cancelled($ride, $user->role === 'driver' ? 'driver' : 'passenger', $previousStatus);
 
     ChatRoom::where('ride_id', $ride->id)->update([
         'status' => 'closed',

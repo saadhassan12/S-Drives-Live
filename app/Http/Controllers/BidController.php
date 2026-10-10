@@ -47,6 +47,7 @@ class BidController extends Controller
             }
 
             reset_ride_visibility_after_bid($ride);
+            emit_ride_bid_received($ride);
 
             notify_bid_update(
                 $passenger->id,
@@ -80,6 +81,7 @@ class BidController extends Controller
         }
 
         reset_ride_visibility_after_bid($ride);
+        emit_ride_bid_received($ride);
 
         notify_bid_update(
             $passenger->id,
@@ -103,16 +105,27 @@ class BidController extends Controller
             return apiResponse(null, 'Bid not found.', 404);
         }
 
+        if ($ride->status === 'accepted' && (int) $ride->bid_id === (int) $bid_id) {
+            return apiResponse(format_bid_for_passenger($bid), 'Bid already accepted.');
+        }
+
+        if (!in_array($ride->status, ['requested', 'in_progress'], true)) {
+            return apiResponse(null, 'This ride is ' . ride_event_status($ride->status) . ' and the bid cannot be accepted.', 409, false);
+        }
+
         $bid->update([
             'user_id' => auth()->id(),
             'status' => 'accepted',
         ]);
 
+        $previousStatus = $ride->status;
         $ride->driver_id = $bid->driver_id;
         $ride->bid_id = $bid_id;
         $ride->final_fare = $bid->amount;
         $ride->status = 'accepted';
         $ride->save();
+
+        emit_ride_status_changed($ride, $previousStatus);
 
         $chatRoom = ChatRoom::updateOrCreate(
             ['ride_id' => $ride->id],

@@ -4,6 +4,7 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use App\Models\ChatRoom;
 use App\Models\Cnic;
 use App\Models\DriverLicenses;
@@ -553,27 +554,141 @@ public function near_ride()
     public function getCaptainById($id)
     {
         $captain = User::with('driverCnic', 'driverliceses', 'vehicles')
-            ->where('id', $id)
             ->where('role', 'driver')
             ->find($id);
-        $completedCount = Ride::where('status', 'completed')
-            ->where('driver_id', $id)
+
+        if (!$captain) {
+            return apiResponse(null, 'Driver not found', 404, false);
+        }
+
+        // One pass over this driver's rides (uses the driver_id index).
+        $rideStats = Ride::where('driver_id', $captain->id)
+            ->whereIn('status', ['completed', 'canceled'])
+            ->selectRaw("COALESCE(SUM(status = 'completed'), 0) as completed_count")
+            ->selectRaw("COALESCE(SUM(status = 'canceled'), 0) as canceled_count")
+            ->selectRaw("MIN(CASE WHEN status = 'completed' THEN created_at END) as first_ride_at")
+            ->selectRaw("MAX(CASE WHEN status = 'completed' THEN updated_at END) as last_ride_at")
+            ->first();
+
+        $completedCount = (int) $rideStats->completed_count;
+        $canceledCount = (int) $rideStats->canceled_count;
+        $totalFinished = $completedCount + $canceledCount;
+
+        $ratingStats = Rating::where('rated_to', $captain->id)
+            ->selectRaw('COUNT(*) as total, AVG(rating) as average')
+            ->selectRaw('COALESCE(SUM(rating = 5), 0) as r5, COALESCE(SUM(rating = 4), 0) as r4')
+            ->selectRaw('COALESCE(SUM(rating = 3), 0) as r3, COALESCE(SUM(rating = 2), 0) as r2')
+            ->selectRaw('COALESCE(SUM(rating = 1), 0) as r1')
+            ->first();
+
+        $ratingCount = (int) $ratingStats->total;
+        $averageRating = $ratingCount > 0 ? round((float) $ratingStats->average, 2) : 0;
+
+        $canceledByDriver = DB::table('cancel_ride')
+            ->where('user_id', $captain->id)
+            ->where('canceled_by', 'driver')
             ->count();
-        $averageRating = Rating::where('rated_to', $id)->avg('rating');
+
+        $recentReviews = Rating::query()
+            ->where('ratings.rated_to', $captain->id)
+            ->leftJoin('users', 'users.id', '=', 'ratings.rated_by')
+            ->orderByDesc('ratings.id')
+            ->limit(5)
+            ->get([
+                'ratings.id', 'ratings.ride_id', 'ratings.rating', 'ratings.comment', 'ratings.created_at',
+                'users.first_name as reviewer_first_name', 'users.last_name as reviewer_last_name',
+                'users.profile_picture as reviewer_profile_picture',
+            ]);
+
+        $vehicle = $captain->vehicles instanceof \Illuminate\Support\Collection
+            ? $captain->vehicles->first()
+            : $captain->vehicles;
+
+        $memberSince = $captain->created_at;
+        $experienceDays = $memberSince ? (int) $memberSince->diffInDays(now()) : 0;
+
         return apiResponse([
+            // Original keys (the app already reads these).
             'captian' => $captain,
-            'average_rating' => round($averageRating, 2),
-            'completed_rides_count' => $completedCount
+            'average_rating' => $averageRating,
+            'completed_rides_count' => $completedCount,
+
+            // Complete profile for the driver profile screen.
+            'profile' => [
+                'id' => $captain->id,
+                'first_name' => $captain->first_name,
+                'last_name' => $captain->last_name,
+                'full_name' => trim($captain->first_name . ' ' . $captain->last_name),
+                'profile_picture' => $captain->profile_picture,
+                'gender' => $captain->gender,
+                'is_online' => (bool) $captain->is_online,
+                'driver_status' => $captain->driver_status,
+                'member_since' => $memberSince?->toIso8601String(),
+                'vehicle' => $vehicle ? [
+                    'vehicle_category_id' => $vehicle->vehicle_category_id,
+                    'manufacture_company' => $vehicle->manufacture_company,
+                    'manufacture_model' => $vehicle->manufacture_model,
+                    'manufacture_year' => $vehicle->manufacture_year,
+                    'registration_number' => $vehicle->registration_number,
+                    'ac' => $vehicle->ac,
+                    'vehicle_front_pic' => $vehicle->vehicle_front_pic,
+                ] : null,
+            ],
+            'stats' => [
+                'average_rating' => $averageRating,
+                'total_ratings' => $ratingCount,
+                'rating_breakdown' => [
+                    '5' => (int) $ratingStats->r5,
+                    '4' => (int) $ratingStats->r4,
+                    '3' => (int) $ratingStats->r3,
+                    '2' => (int) $ratingStats->r2,
+                    '1' => (int) $ratingStats->r1,
+                ],
+                'total_rides' => $totalFinished,
+                'completed_rides' => $completedCount,
+                'cancelled_rides' => $canceledCount,
+                'cancelled_by_driver' => $canceledByDriver,
+                'completion_rate' => $totalFinished > 0 ? round($completedCount / $totalFinished * 100, 1) : 0,
+                'experience_days' => $experienceDays,
+                'experience_years' => round($experienceDays / 365, 1),
+                'first_ride_at' => $rideStats->first_ride_at,
+                'last_ride_at' => $rideStats->last_ride_at,
+            ],
+            'recent_reviews' => $recentReviews,
         ], 'Driver Get By ID');
     }
-    
-    
+
+
+    /** Driver actions only apply to an open ride that belongs to this driver (never revive a canceled one). */
+    private function guardDriverRide(Ride $ride)
+    {
+        if (!in_array($ride->status, ['accepted', 'driver_reach', 'started_ride', 'ride_pick'], true)) {
+            return apiResponse(
+                ['ride_id' => $ride->id, 'status' => ride_event_status($ride->status)],
+                'This ride is ' . ride_event_status($ride->status) . ' and cannot be updated.',
+                409,
+                false
+            );
+        }
+
+        if ($ride->driver_id && (int) $ride->driver_id !== (int) auth()->id()) {
+            return apiResponse(null, 'This ride is assigned to another driver.', 403, false);
+        }
+
+        return null;
+    }
+
      public function driverreach(Request $request, $rideId)
     {
         $ride = Ride::findOrFail(resolve_ride_id($rideId));
+        if ($blocked = $this->guardDriverRide($ride)) {
+            return $blocked;
+        }
+        $previousStatus = $ride->status;
         $ride->driver_id = auth()->id();
         $ride->status = 'driver_reach';
         $ride->save();
+        emit_ride_status_changed($ride, $previousStatus);
         
         // ✅ Get the passenger user model (user_id refers to passenger)
         $passenger = \App\Models\User::find($ride->user_id);
@@ -590,9 +705,14 @@ public function near_ride()
        public function startedride(Request $request, $rideId)
     {
         $ride = Ride::findOrFail(resolve_ride_id($rideId));
+        if ($blocked = $this->guardDriverRide($ride)) {
+            return $blocked;
+        }
+        $previousStatus = $ride->status;
         $ride->driver_id = auth()->id();
         $ride->status = 'started_ride';
         $ride->save();
+        emit_ride_status_changed($ride, $previousStatus);
     
         // ✅ Get the passenger user model
         $passenger = \App\Models\User::find($ride->user_id);
@@ -616,9 +736,14 @@ public function near_ride()
           public function pickride(Request $request, $rideId)
         {
             $ride = Ride::findOrFail(resolve_ride_id($rideId));
+        if ($blocked = $this->guardDriverRide($ride)) {
+            return $blocked;
+        }
+            $previousStatus = $ride->status;
             $ride->driver_id = auth()->id();
             $ride->status = 'ride_pick';
             $ride->save();
+            emit_ride_status_changed($ride, $previousStatus);
             
                     // ✅ Get the passenger user model
          $passenger = \App\Models\User::find($ride->user_id);
@@ -711,8 +836,19 @@ public function near_ride()
         return response()->json(['message' => 'Unauthorized'], 403);
     }
 
+    if (!in_array($ride->status, ['accepted', 'driver_reach', 'started_ride', 'ride_pick'], true)) {
+        return apiResponse(
+            ['ride_id' => $ride->id, 'status' => ride_event_status($ride->status)],
+            'This ride is ' . ride_event_status($ride->status) . ' and cannot be completed.',
+            409,
+            false
+        );
+    }
+
+    $previousStatus = $ride->status;
     $ride->status = 'completed';
     $ride->save();
+    emit_ride_completed($ride, $previousStatus);
 
     ChatRoom::where('ride_id', $ride->id)->update([
         'status' => 'closed',

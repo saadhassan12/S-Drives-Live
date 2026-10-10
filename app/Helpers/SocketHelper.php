@@ -120,6 +120,8 @@ if (!function_exists('notify_drivers_new_ride')) {
 
         $rideForApp = $rideData;
         unset($rideForApp['fare_updated']);
+        // Never push the passenger's push token to drivers.
+        unset($rideForApp['user']['device_token']);
 
         $rideId = (int) ($rideData['ride_id'] ?? $rideData['id'] ?? 0);
 
@@ -184,7 +186,16 @@ if (!function_exists('notify_drivers_new_ride')) {
             'visibility_seconds' => ride_visibility_seconds(),
         ];
 
-        return broadcast_socket_event('driver:nearby-rides:list', $listPayload, $socketDriverIds, false)
+        $newRidePayload = array_merge($rideForApp, [
+            'ride_id' => $rideId,
+            'id' => $rideId,
+            'status' => ride_event_status($rideForApp['status'] ?? null),
+            'fare' => $rideForApp['final_fare'] ?? $rideForApp['estimated_fare'] ?? null,
+            'updated_at' => $rideForApp['updated_at'] ?? now()->toIso8601String(),
+        ]);
+
+        return broadcast_socket_event('driver:new-ride', $newRidePayload, $socketDriverIds, false)
+            && broadcast_socket_event('driver:nearby-rides:list', $listPayload, $socketDriverIds, false)
             && broadcast_socket_event('driver:new-ride-available', [
                 'ride' => $rideForApp,
                 'ride_id' => $rideId,
@@ -307,5 +318,178 @@ if (!function_exists('notify_bid_update')) {
         return broadcast_socket_event('ride:bid-updated', [
             'bid' => $bidData,
         ], $userId);
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| Ride lifecycle socket events (driver + passenger)
+|--------------------------------------------------------------------------
+| Every payload carries ride_id, status and updated_at. Fare is never 0:
+| the last positive fare is used. "canceled" in the DB is emitted as "cancelled".
+*/
+if (!function_exists('ride_event_status')) {
+    function ride_event_status(?string $status): ?string
+    {
+        return $status === 'canceled' ? 'cancelled' : $status;
+    }
+}
+
+if (!function_exists('ride_event_fare')) {
+    function ride_event_fare(\App\Models\Ride $ride)
+    {
+        foreach ([$ride->final_fare, $ride->estimated_fare] as $fare) {
+            if (is_numeric($fare) && (float) $fare > 0) {
+                return $fare + 0;
+            }
+        }
+
+        return null;
+    }
+}
+
+if (!function_exists('ride_event_payload')) {
+    function ride_event_payload(\App\Models\Ride $ride, array $extra = []): array
+    {
+        return array_merge([
+            'ride_id' => (int) $ride->id,
+            'id' => (int) $ride->id,
+            'status' => ride_event_status($ride->status),
+            'updated_at' => ($ride->updated_at ?? now())->toIso8601String(),
+            'fare' => ride_event_fare($ride),
+            'driver_id' => $ride->driver_id ? (int) $ride->driver_id : null,
+            'passenger_id' => $ride->user_id ? (int) $ride->user_id : null,
+            'start' => $ride->start,
+            'destination' => $ride->destination,
+            'start_latitude' => $ride->start_latitude,
+            'start_longitude' => $ride->start_longitude,
+            'end_latitude' => $ride->end_latitude,
+            'end_longitude' => $ride->end_longitude,
+        ], $extra);
+    }
+}
+
+if (!function_exists('ride_event_full')) {
+    /**
+     * Complete ride for status/complete/cancel events: every ride column plus the passenger,
+     * driver, vehicle category and driver vehicle. Push tokens are never sent.
+     */
+    function ride_event_full(\App\Models\Ride $ride, array $extra = []): array
+    {
+        $full = \App\Models\Ride::with(['user', 'driver', 'vehicleCategory', 'vehicles'])->find($ride->id);
+        $data = $full ? $full->toArray() : $ride->toArray();
+
+        foreach (['user', 'driver'] as $person) {
+            unset($data[$person]['device_token']);
+        }
+        $data['passenger'] = $data['user'] ?? null;
+
+        return array_merge($data, ride_event_payload($ride), $extra);
+    }
+}
+
+if (!function_exists('ride_event_current')) {
+    /** Full ride object (with people and pending bids) for *:current-ride events. */
+    function ride_event_current(\App\Models\Ride $ride, bool $withBids = false): array
+    {
+        $current = ride_event_payload($ride);
+        $current['ride'] = \App\Models\Ride::with(['user', 'driver', 'vehicleCategory'])
+            ->find($ride->id)?->toArray() ?? $ride->toArray();
+        $current['ride']['status'] = ride_event_status($ride->status);
+
+        if ($withBids) {
+            $current['bids'] = format_bids_for_passenger(
+                \App\Models\Bid::where('ride_id', $ride->id)->where('status', 'pending')->get()
+            );
+        }
+
+        return $current;
+    }
+}
+
+if (!function_exists('emit_ride_created')) {
+    /** Passenger side of a new ride request (drivers get driver:new-ride from notify_drivers_new_ride). */
+    function emit_ride_created(\App\Models\Ride $ride): void
+    {
+        $passengerId = (int) $ride->user_id;
+
+        broadcast_socket_event('passenger:ride-created', ride_event_payload($ride, [
+            'pickup' => $ride->start,
+            'dropoff' => $ride->destination,
+        ]), $passengerId);
+        broadcast_socket_event('passenger:current-ride', ride_event_current($ride, true), $passengerId);
+    }
+}
+
+if (!function_exists('emit_ride_bid_received')) {
+    /** A driver sent or changed an offer: passenger sees it, fare stays the ride fare. */
+    function emit_ride_bid_received(\App\Models\Ride $ride): void
+    {
+        $passengerId = (int) $ride->user_id;
+        $current = ride_event_current($ride, true);
+
+        broadcast_socket_event('passenger:ride-updated', $current, $passengerId);
+        broadcast_socket_event('passenger:current-ride', $current, $passengerId);
+    }
+}
+
+if (!function_exists('emit_ride_status_changed')) {
+    /**
+     * Ride moved to a new status (accepted, started_ride, driver_reach, ride_pick, completed).
+     * Sent to the assigned driver and the passenger.
+     */
+    function emit_ride_status_changed(\App\Models\Ride $ride, ?string $previousStatus): void
+    {
+        $passengerId = (int) $ride->user_id;
+        $driverId = (int) $ride->driver_id;
+
+        $changed = ride_event_full($ride, [
+            'previous_status' => ride_event_status($previousStatus),
+        ]);
+        $current = ride_event_current($ride);
+
+        if ($driverId > 0) {
+            if ($ride->status === 'accepted') {
+                broadcast_socket_event('driver:get-accepted-rides', [
+                    'ride_id' => (int) $ride->id,
+                    'status' => 'accepted',
+                    'updated_at' => $changed['updated_at'],
+                ], $driverId);
+            }
+            broadcast_socket_event('driver:ride-updated', $current, $driverId);
+            broadcast_socket_event('driver:current-ride', $current, $driverId);
+            broadcast_socket_event('ride:status-changed', $changed, $driverId);
+        }
+
+        broadcast_socket_event('passenger:ride-updated', $current, $passengerId);
+        broadcast_socket_event('passenger:current-ride', $current, $passengerId);
+        broadcast_socket_event('ride:status-changed', $changed, $passengerId);
+    }
+}
+
+if (!function_exists('emit_ride_cancelled')) {
+    /** Only for a real cancel by the passenger or the driver. */
+    function emit_ride_cancelled(\App\Models\Ride $ride, string $cancelledBy, ?string $previousStatus = null): void
+    {
+        $payload = ride_event_full($ride, [
+            'cancelled_by' => $cancelledBy,
+            'previous_status' => ride_event_status($previousStatus),
+        ]);
+
+        $userIds = array_values(array_unique(array_filter([(int) $ride->user_id, (int) $ride->driver_id])));
+        broadcast_socket_event('ride:cancelled', $payload, $userIds);
+    }
+}
+
+if (!function_exists('emit_ride_completed')) {
+    function emit_ride_completed(\App\Models\Ride $ride, ?string $previousStatus): void
+    {
+        emit_ride_status_changed($ride, $previousStatus);
+
+        $payload = ride_event_full($ride);
+        $userIds = array_values(array_unique(array_filter([(int) $ride->user_id, (int) $ride->driver_id])));
+
+        broadcast_socket_event('ride:completed', $payload, $userIds);
+        broadcast_socket_event('driver:ride-completed', $payload, $userIds);
     }
 }

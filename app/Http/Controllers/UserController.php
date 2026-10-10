@@ -11,6 +11,7 @@ use App\Models\Ride;
 use App\Models\LoginHistory;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Http\JsonResponse;
 
 
@@ -172,8 +173,14 @@ public function getOtp(Request $request)
                     return apiResponse(null, 'Your account has been deleted. Please contact admin for assistance.', 403);
                 }
 
+                // OTP verified once: from now on this user logs in with the number only.
+                $user->is_verified = true;
+
                 return $this->loginUser($user, $request->device_token, 'OTP verified successfully.');
             } else {
+                // Number is OTP-verified; signup within 30 minutes marks the new user verified.
+                Cache::put('otp_verified_' . $mobile_number, true, now()->addMinutes(30));
+
                 return apiResponse(
                     null,
                     'OTP verified successfully. Please sign in to continue.',
@@ -195,7 +202,13 @@ public function getOtp(Request $request)
             ->update(['logout_time' => now()]);
 
         $token = $user->createToken('Api Token')->accessToken;
-        $user->device_token = $deviceToken ?? 'default_token';
+        // Keep the push token we already have when the app does not send one (e.g. number-only login),
+        // otherwise this user would silently stop receiving push notifications.
+        if (is_valid_device_token($deviceToken)) {
+            $user->device_token = $deviceToken;
+        } elseif (empty($user->device_token)) {
+            $user->device_token = 'default_token';
+        }
         $user->is_online = true;
         $user->save();
 
@@ -248,6 +261,7 @@ public function getOtp(Request $request)
             'profile_picture' => $profile_picture_path,
             'mobile_number' => $mobile_number,
             'otp_verified_at' => now(),
+            'is_verified' => (bool) Cache::pull('otp_verified_' . $mobile_number),
             'device_token' => $request->device_token ?? 'default_token',
            
 
@@ -352,13 +366,21 @@ public function getOtp(Request $request)
     {
         $request->validate([
             'in_foreground' => 'required|boolean',
+            'device_token' => 'nullable|string|max:4096',
         ]);
 
         $user = auth()->user();
-        $user->update([
+        $updates = [
             'is_app_foreground' => $request->boolean('in_foreground'),
             'last_seen_at' => now(),
-        ]);
+        ];
+
+        // The app can refresh its FCM token here (on start / resume) without logging in again.
+        if (is_valid_device_token($request->input('device_token'))) {
+            $updates['device_token'] = $request->input('device_token');
+        }
+
+        $user->update($updates);
 
         return apiResponse($user->fresh(), 'App state updated successfully.');
     }

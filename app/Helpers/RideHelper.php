@@ -63,7 +63,15 @@ if (!function_exists('allocate_socket_reshow_ride_id')) {
      */
     function allocate_socket_reshow_ride_id(int $originalId): int
     {
-        $displayId = 1800000000 + (int) Cache::increment('socket_reshow_seq');
+        // The database cache driver returns false when incrementing a missing key,
+        // which made every fare update share id 1800000000 (and alias to the wrong ride).
+        Cache::add('socket_reshow_seq', 0);
+        $seq = Cache::increment('socket_reshow_seq');
+        if (!is_int($seq) || $seq <= 0) {
+            $seq = random_int(1, 300000000);
+        }
+
+        $displayId = 1800000000 + $seq;
         Cache::put("socket_ride_alias_{$displayId}", $originalId, now()->addHours(6));
 
         return $displayId;

@@ -3,6 +3,7 @@
 namespace App\Http\Controllers;
 
 use App\Models\ChatRoom;
+use App\Models\Ride;
 use App\Models\User;
 use Illuminate\Http\Request;
 
@@ -75,6 +76,46 @@ class SocketController extends Controller
         User::where('id', $data['user_id'])->update(['last_seen_at' => now()]);
 
         return response()->json(['ok' => true]);
+    }
+
+    /**
+     * Driver GPS point from the socket server: saves it and says who may see it.
+     * Only an assigned driver on an active ride is returned as "active".
+     */
+    public function driverLocation(Request $request)
+    {
+        $this->assertSecret($request);
+
+        $data = $request->validate([
+            'user_id' => 'required|integer|exists:users,id',
+            'ride_id' => 'nullable|integer',
+            'latitude' => 'required|numeric',
+            'longitude' => 'required|numeric',
+        ]);
+
+        $lat = (float) $data['latitude'];
+        $lng = (float) $data['longitude'];
+
+        if ($lat == 0.0 && $lng == 0.0) {
+            return response()->json(['ok' => false, 'active' => false]);
+        }
+
+        User::where('id', $data['user_id'])->where('role', 'driver')
+            ->update(['latitude' => $lat, 'longitude' => $lng]);
+
+        $ride = !empty($data['ride_id']) ? Ride::find(resolve_ride_id($data['ride_id'])) : null;
+        $active = $ride
+            && (int) $ride->driver_id === (int) $data['user_id']
+            && in_array($ride->status, ['accepted', 'driver_reach', 'started_ride', 'ride_pick'], true);
+
+        return response()->json([
+            'ok' => true,
+            'active' => (bool) $active,
+            'ride_id' => $active ? (int) $ride->id : null,
+            'passenger_id' => $active ? (int) $ride->user_id : null,
+            'driver_id' => $active ? (int) $ride->driver_id : null,
+            'status' => $active ? $ride->status : null,
+        ]);
     }
 
     protected function assertSecret(Request $request): void
