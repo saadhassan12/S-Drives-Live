@@ -90,13 +90,24 @@ public function toFirebase()
     }
 
     try {
-        $response = $client->post($url, [
+        $request = [
             'headers' => [
                 'Authorization' => "Bearer {$accessToken}",
                 'Content-Type' => 'application/json',
             ],
             'json' => $payload,
-        ]);
+        ];
+
+        // FCM sometimes answers 5xx / drops the connection for a moment: one retry so the push is not lost.
+        try {
+            $response = $client->post($url, $request);
+        } catch (\GuzzleHttp\Exception\ConnectException $e) {
+            usleep(300000);
+            $response = $client->post($url, $request);
+        } catch (\GuzzleHttp\Exception\ServerException $e) {
+            usleep(300000);
+            $response = $client->post($url, $request);
+        }
 
         return [
             'message' => 'Notification sent!',

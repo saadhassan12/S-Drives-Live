@@ -138,9 +138,21 @@ class BidController extends Controller
             ]
         );
 
+        $otherBidDriverIds = Bid::where('ride_id', $rideId)
+            ->where('id', '!=', $bid_id)
+            ->pluck('driver_id');
+
         Bid::where('ride_id', $rideId)
             ->where('id', '!=', $bid_id)
             ->delete();
+
+        foreach (User::whereIn('id', $otherBidDriverIds)->get() as $otherDriver) {
+            send_user_push_notification(
+                $otherDriver,
+                'Ride Taken',
+                'The passenger chose another captain for this ride.'
+            );
+        }
 
         $driver = User::find($bid->driver_id);
 

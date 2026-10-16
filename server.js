@@ -30,7 +30,7 @@
   const SOCKET_INTERNAL_SECRET = process.env.SOCKET_INTERNAL_SECRET || "";
   const RIDE_VISIBILITY_MS = Math.max(
     60000,
-    Number(process.env.RIDE_VISIBILITY_SECONDS || 60) * 1000
+    Number(process.env.RIDE_VISIBILITY_SECONDS || 120) * 1000
   );
 
   function getForcedRidesFromBroadcast(data) {

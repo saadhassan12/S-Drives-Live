@@ -40,21 +40,8 @@ if (!function_exists('is_user_actively_in_app')) {
 if (!function_exists('should_send_push_notification')) {
     function should_send_push_notification($user): bool
     {
-        if (!$user) {
-            return true;
-        }
-
-        if (!$user->id) {
-            return !is_user_actively_in_app($user);
-        }
-
-        $freshUser = User::find($user->id);
-
-        if (!$freshUser) {
-            return true;
-        }
-
-        return !is_user_actively_in_app($freshUser);
+        // Every push is delivered whether the app is open, in the background or killed.
+        return true;
     }
 }
 

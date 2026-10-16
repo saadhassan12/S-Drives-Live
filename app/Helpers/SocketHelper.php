@@ -71,11 +71,11 @@ if (!function_exists('notify_users_socket')) {
 }
 
 /**
- * Mark a ride as visible to specific drivers for a short window (default 60 seconds).
+ * Mark a ride as visible to specific drivers for a short window (default 120 seconds).
  * After the window expires, near_ride() stops returning it until re-marked (new ride / fare update).
  */
 if (!function_exists('mark_ride_visible_for_drivers')) {
-    function mark_ride_visible_for_drivers(array $driverIds, int $rideId, int $seconds = 60): void
+    function mark_ride_visible_for_drivers(array $driverIds, int $rideId, int $seconds = 120): void
     {
         foreach ($driverIds as $driverId) {
             Cache::put(
@@ -276,7 +276,7 @@ if (!function_exists('notify_passenger_ride_update')) {
 if (!function_exists('ride_visibility_seconds')) {
     function ride_visibility_seconds(): int
     {
-        return max(60, (int) config('ride.visibility_seconds', 60));
+        return max(60, (int) config('ride.visibility_seconds', 120));
     }
 }
 

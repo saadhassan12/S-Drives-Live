@@ -117,7 +117,7 @@ if (!function_exists('get_ride_previously_notified_driver_ids')) {
 }
 
 if (!function_exists('cache_pending_fare_ride_for_driver')) {
-    function cache_pending_fare_ride_for_driver(int $driverId, int $rideId, array $rideDetails, int $seconds = 60, ?int $displayId = null): void
+    function cache_pending_fare_ride_for_driver(int $driverId, int $rideId, array $rideDetails, int $seconds = 120, ?int $displayId = null): void
     {
         Cache::put("driver_{$driverId}_pending_fare_ride", [
             'ride_id' => $rideId,
@@ -127,7 +127,7 @@ if (!function_exists('cache_pending_fare_ride_for_driver')) {
             'estimated_fare' => $rideDetails['estimated_fare'] ?? null,
             'fare_updated' => true,
             'updated_at' => now()->toIso8601String(),
-        ], now()->addSeconds(max($seconds, 60)));
+        ], now()->addSeconds(max($seconds, 120)));
     }
 }
 

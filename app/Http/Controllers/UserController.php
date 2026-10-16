@@ -39,12 +39,20 @@ public function getOtp(Request $request)
 
     // Already verified users log in with the number only: no SMS, token returned directly.
     $verifiedUser = User::withTrashed()->where('mobile_number', $mobile_number)->first();
-    if ($verifiedUser && $verifiedUser->is_verified) {
+    // Off by default: every login goes through the OTP flow. Set NUMBER_ONLY_LOGIN=true to enable.
+    if (config('auth_login.number_only_login', false) && $verifiedUser && $verifiedUser->is_verified) {
         if ($verifiedUser->trashed()) {
             return apiResponse(null, 'Your account has been deleted. Please contact admin for assistance.', 403);
         }
 
-        return $this->loginUser($verifiedUser, $request->input('device_token'), 'Login successful.');
+        // Without a push token the user could never receive ride notifications. If the app did not send
+        // one and we hold none, fall through to the OTP flow: verify-otp carries the device token.
+        $hasPushToken = is_valid_device_token($request->input('device_token'))
+            || is_valid_device_token($verifiedUser->device_token);
+
+        if ($hasPushToken || !config('auth_login.require_push_token', true)) {
+            return $this->loginUser($verifiedUser, $request->input('device_token'), 'Login successful.');
+        }
     }
 
     // ? Define your special test numbers
@@ -205,6 +213,7 @@ public function getOtp(Request $request)
         // Keep the push token we already have when the app does not send one (e.g. number-only login),
         // otherwise this user would silently stop receiving push notifications.
         if (is_valid_device_token($deviceToken)) {
+            User::where('device_token', $deviceToken)->where('id', '!=', $user->id)->update(['device_token' => 'default_token']);
             $user->device_token = $deviceToken;
         } elseif (empty($user->device_token)) {
             $user->device_token = 'default_token';
@@ -377,6 +386,7 @@ public function getOtp(Request $request)
 
         // The app can refresh its FCM token here (on start / resume) without logging in again.
         if (is_valid_device_token($request->input('device_token'))) {
+            User::where('device_token', $request->input('device_token'))->where('id', '!=', $user->id)->update(['device_token' => 'default_token']);
             $updates['device_token'] = $request->input('device_token');
         }
 
@@ -398,10 +408,10 @@ public function getOtp(Request $request)
                 ->whereIn('status', ['accepted'])
                 ->update(['status' => 'canceled']);
 
-            // Stop ride notifications after logout and invalidate push target.
+            // The push token is kept on logout so a later number-only login still has one.
+            // Ride request pushes stop anyway: they require last_login_at = 1.
             $user->update([
                 'last_login_at' => 0,
-                'device_token' => 'default_token',
                 'is_online' => false,
                 'is_app_foreground' => false,
             ]);
@@ -469,7 +479,6 @@ public function logoutUserById(): JsonResponse
         $user->tokens()->where('revoked', false)->update(['revoked' => true]);
         $user->update([
             'last_login_at' => 0,
-            'device_token' => 'default_token',
         ]);
 
         $loggedOutUsers[] = [
