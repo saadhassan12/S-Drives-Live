@@ -37,11 +37,29 @@ if (!function_exists('is_user_actively_in_app')) {
     }
 }
 
+if (!function_exists('user_has_active_session')) {
+    function user_has_active_session(int $userId): bool
+    {
+        return \Illuminate\Support\Facades\DB::table('oauth_access_tokens')
+            ->where('user_id', $userId)
+            ->where('revoked', 0)
+            ->where(function ($q) {
+                $q->whereNull('expires_at')->orWhere('expires_at', '>', now());
+            })
+            ->exists();
+    }
+}
+
 if (!function_exists('should_send_push_notification')) {
     function should_send_push_notification($user): bool
     {
-        // Every push is delivered whether the app is open, in the background or killed.
-        return true;
+        // Every push is delivered whether the app is open, in the background or killed,
+        // but only while the user is logged in: logout revokes the API tokens.
+        if (!$user || !$user->id) {
+            return true;
+        }
+
+        return user_has_active_session((int) $user->id);
     }
 }
 
@@ -56,7 +74,8 @@ if (!function_exists('can_driver_receive_ride_notifications')) {
         // keeps its socket open), so a ride request push is never skipped because of it.
         return $user->role === 'driver'
             && (int) $user->last_login_at === 1
-            && is_valid_device_token($user->device_token);
+            && is_valid_device_token($user->device_token)
+            && user_has_active_session((int) $user->id);
     }
 }
 
@@ -189,7 +208,7 @@ if (!function_exists('send_driver_fare_update_notification')) {
             return false;
         }
 
-        if (!is_valid_device_token($driver->device_token)) {
+        if (!is_valid_device_token($driver->device_token) || !user_has_active_session((int) $driver->id)) {
             return false;
         }
 
