@@ -8,6 +8,7 @@ use App\Http\Controllers\ModeController;
 use App\Http\Controllers\UserController;
 use App\Http\Controllers\DropDownController;
 use App\Http\Controllers\RatingController;
+use App\Http\Controllers\PromoController;
 use App\Http\Controllers\RidesController;
 use App\Http\Controllers\SocketController;
 use Illuminate\Http\Request;
@@ -123,6 +124,9 @@ Route::controller(RidesController::class)->middleware(['auth:api', AutoLogout::c
      Route::get('/ride/{rideId}/get-rate-customer', [RatingController::class, 'getrateCustomer']);
     Route::get('/ride/{rideId}/get-rate-driver', [RatingController::class, 'getrateDriver']);
 });
+
+Route::get('/promo-codes', [PromoController::class, 'index'])->middleware(['auth:api', AutoLogout::class]);
+Route::post('/promo/validate', [PromoController::class, 'validatePromo'])->middleware(['auth:api', AutoLogout::class]);
 
 Route::controller(ChatController::class)->middleware(['auth:api', AutoLogout::class])->group(function () {
     Route::get('/chat/rooms', 'rooms');
